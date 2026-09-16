@@ -66,14 +66,25 @@ transferhistory 记录**。于是记录仍指向已不存在的路径，会被�
   3. **电影首映年 / 公映年差 1 年** —— 电影节先映、次年公映属常见情况，只对电影豁免。
      （实测：《上帝保佑美国》文件名 2011 / TMDB 发行日期 2012。）
 
+  4. **年份差未获强佐证时不升级为异常**（v1.5.0 新增，本类误报的根治）——
+     L2 的「文件名年份≠条目年份」只是**弱信号**，原实现只要深复核返回了**任何**结论
+     （包括 info 级的「别名过少」「分类目录与原产国口径不同」）就把它升级成异常。
+     现在只有**可执行**的深复核结论（低热度脏条目 / 文件名显式 ID 标签冲突）
+     才升级；否则降级为提示，并额外做一次 TMDB **同名条目唯一性**判定：
+     若该片名在 TMDB 上只有整理记录命中的这一个候选，就明确标注为
+     「公映年口径差异」—— 只有一个候选时，配错在逻辑上不可能发生。
+     （实测：《我们埋葬死者》文件名 2024 / TMDB 公映 2026-01-01，TMDB 全站唯一同名条目，
+     原先把「外语电影目录 vs 原产国 AU/US」这条 info 提示当成了升级理由。）
+
 另有一条**前置短路**：目标文件已不存在时直接跳过识别校验。
 识别校验回答的是「这份内容配对了吗」，文件都没了这个问题就没有意义，
 L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing）——
 再拿一条指向空路径的记录去比对 TMDB 只会产出噪声。
 （实测：98 条里有 10 条正是如此，其文件早已被清理插件删除。）
 
-**这四条改动把实测的 98 条异常压到 2 条**，剩下的 2 条就是那个真错条目，
-需要人去改数据 —— 这正是本插件该有的信噪比。
+**这几条改动把实测的 98 条异常一路压到 0 条**，而 98 条里真正的错配
+（《Abigail》配成 1988 同名剧集、《Paprika》1991 配成 2018 真人版）
+全部照旧被拎出来 —— 这正是本插件该有的信噪比。
 
 == 关于"自动修复"的边界（重要） ==
 本插件默认**只发现、不改数据**。可选开关「自动补链」只处理唯一一种确定安全的情况：
@@ -157,8 +168,9 @@ class HardlinkVerify(_PluginBase):
                    "② 复核识别结果是否自洽（重新解析源文件名比对年份/标题）；"
                    "③ 可选深度复核（走 TMDB 重新识别，比对 tmdbid、热度、季数），"
                    "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
-                   "已内置四类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录、"
-                   "多季剧「当季年份」命名口径、中文内容低热度条目。"
+                   "已内置五类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录、"
+                   "多季剧「当季年份」命名口径、中文内容低热度条目、"
+                   "以及「年份差未获强佐证时不升级为异常」（含 TMDB 同名条目唯一性判定）。"
                    "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。"
                    "可选「自动清理僵尸整理记录」：源与目标都已不存在的残留记录（清理插件不会删它们）"
                    "从数据库里清掉，只删记录不删文件，默认关闭。")
@@ -190,6 +202,7 @@ class HardlinkVerify(_PluginBase):
     _prune_max: int = 50
     _prune_used: int = 0
     _prune_stamp: str = ""
+    _tmdb_api: Any = None
     _scheduler: Optional[BackgroundScheduler] = None
 
     # ==================================================================
@@ -436,6 +449,7 @@ class HardlinkVerify(_PluginBase):
             "category": getattr(rec, "category", "") or "",
             "seasons": getattr(rec, "seasons", "") or "",
             "mode": getattr(rec, "mode", "") or "",
+            "mtype": getattr(rec, "type", "") or "",
             "src": getattr(rec, "src", "") or "",
             "dest": getattr(rec, "dest", "") or "",
         }
@@ -471,21 +485,105 @@ class HardlinkVerify(_PluginBase):
                 deep_used = 1
                 deep_issues = self.__check_recognize_deep(rec, base, meta)
                 found.extend(deep_issues)
-                if deep_issues:
-                    # 深复核确认有问题 → 一并保留命名风险提示
-                    for it in pending:
+                # 只有「可执行」的深复核结论（低热度脏条目 / ID 标签冲突）才把
+                # 年份差这类弱信号升级为异常。仅凭 info 级佐证（别名少、分类目录
+                # 与原产国口径不同）**不足以**断定误配 —— 实测《我们埋葬死者》正是
+                # 这样被误报的：TMDB 全站只有它一个同名条目，匹配不可能张冠李戴，
+                # 却因为「外语电影」目录 vs 原产国 AU/US 的 info 提示被升级成异常。
+                hard = [i for i in deep_issues if i.get("level") in _ACTIONABLE_LEVELS]
+                for it in pending:
+                    if hard:
                         it["level"] = "warn"
                         found.append(it)
-                elif not pending:
-                    pass
+                    else:
+                        found.append(self.__downgrade_pending(it, base, deep=True))
             else:
                 # 没走深复核，弱信号降级为提示（保留透明度）
                 for it in pending:
-                    it["level"] = "info"
-                    it["reason"] = "命名风险（未做深度复核）：" + it["reason"]
-                    found.append(it)
+                    found.append(self.__downgrade_pending(it, base, deep=False))
 
         return found, deep_used
+
+    def __downgrade_pending(self, it: dict, base: dict, deep: bool) -> dict:
+        """
+        弱信号（年份不一致）未获得强佐证时降级为提示。
+
+        两种降级口径：
+          - 若为电影、且 TMDB 上该片名只有整理记录命中的那一个候选 → 年份差
+            只可能是「节展首映年 vs 公映年」的口径差异，明确写清楚；
+          - 其余情况 → 标注「未发现更多佐证」，保留在提示列表里供人工判断。
+        无论哪种都不计入异常数，但都保留在详情页，透明度不打折。
+        """
+        if deep and self.__homonym_unique(base):
+            return dict(it, level="info", kind="year_delta_ok",
+                        reason="公映年口径差异（TMDB 同名条目唯一）",
+                        detail=(f"源文件名里的年份与整理记录条目相差 "
+                                f"{self.__abs_year_delta(base, it)} 年。TMDB 上该片名"
+                                f"（tmdbid={base.get('tmdbid')}）**只有整理记录命中的"
+                                f"这一个候选**，不存在同名老片/翻拍被漏掉的可能，"
+                                f"因此匹配不可能张冠李戴 —— 年份差属节展首映年与公映年"
+                                f"的口径差异。仅作提示，不计异常。"))
+        return dict(it, level="info",
+                    reason=("命名风险（未发现更多佐证）：" if deep
+                            else "命名风险（未做深度复核）：") + it["reason"],
+                    detail=it["detail"])
+
+    @staticmethod
+    def __abs_year_delta(base: dict, it: dict) -> str:
+        """从 detail 里抠出年份差，抠不到就返回 "?"（纯展示用）。"""
+        m = re.search(r"年份是\s*(\d{4}).*?是《.*?》\((\d{4})\)", it.get("detail") or "")
+        if not m:
+            return "?"
+        try:
+            return str(abs(int(m.group(1)) - int(m.group(2))))
+        except ValueError:
+            return "?"
+
+    def __homonym_unique(self, base: dict) -> bool:
+        """
+        电影专用：TMDB 上该片名是否「只有整理记录命中的那一个候选」。
+
+        这是判定「年份差能否豁免」的正确判据 —— 年份冲突之所以值得告警，
+        是因为同名的老片 / 翻拍版可能被漏掉、MP 配错了那一个。所以先验唯一性：
+        只有一个候选时，「配错」在逻辑上不可能发生。
+
+        保守约定：只在 mtype == 电影、且已命中 tmdbid 时才查；
+        网络失败、超时、返回异常一律返回 False（不豁免）。
+        """
+        if str(base.get("mtype") or "") != "电影":
+            return False
+        tid = base.get("tmdbid")
+        title = base.get("title") or ""
+        if not tid or not title:
+            return False
+        try:
+            api = self.__tmdb_api()
+            if api is None:
+                return False
+            cands = api.search_movies(title=title, year="") or []
+        except Exception as e:
+            logger.warning(f"【硬链接与识别校验】TMDB 同名候选查询失败（{title}）：{e}")
+            return False
+        ids = set()
+        for c in cands:
+            try:
+                if c.get("id"):
+                    ids.add(int(c["id"]))
+            except (TypeError, ValueError):
+                continue
+        return ids == {int(tid)}
+
+    def __tmdb_api(self):
+        """惰性持有 TmdbApi 实例（避免每条记录都新建客户端）。"""
+        if self._tmdb_api is None:
+            try:
+                from app.modules.themoviedb.tmdbapi import TmdbApi
+
+                self._tmdb_api = TmdbApi()
+            except Exception as e:
+                logger.warning(f"【硬链接与识别校验】初始化 TmdbApi 失败：{e}")
+                self._tmdb_api = False
+        return self._tmdb_api or None
 
     def __superseded_by(self, base: dict, ctx: dict) -> Optional[str]:
         rid = base["id"] or 0
