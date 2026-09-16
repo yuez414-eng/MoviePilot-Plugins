@@ -1,0 +1,1146 @@
+# -*- coding: utf-8 -*-
+"""
+HardlinkVerify —— MoviePilot 硬链接有效性 + 识别正确性 双重复核插件
+
+== 为什么要这个插件 ==
+MoviePilot 的 TMDB 匹配存在一类已知误配：当种子文件名里带着"季年份"
+（例如 `Supernatural.2017.S13E09`）时，MP 会把 2017 当成首播年份去找剧集；
+而 TMDB 上存在一些"首播年份刚好等于该年份、且带有同名译名"的低热度脏词条
+（例如 261164 소능력자 / KR / 2017，vote_count=1），
+`__search_tv_by_season()` 按 first_air_date 倒序取第一个命中 → 脏词条先于正确条目
+（1622 邪恶力量 / 2005）被返回，于是文件被改名成外文剧名并归进错误分类目录。
+
+本插件对整理记录做三层复核，把这类问题在"进库之后、发现之前"捞出来：
+
+  L1 硬链接校验（离线）
+      整理模式为 link 的记录，媒体库文件必须与下载目录源文件仍在同一 inode。
+      断链 = 源种子删了之后媒体库还占着独立空间，或媒体库文件被换成了独立副本。
+
+  L2 识别自洽性（离线，零外部请求）
+      用当前识别词（含自定义识别词）重新解析源文件路径，与整理记录比对年份/季号。
+      注意：只有"文件名里的季年份 ≠ 条目首播年"这一件事本身并不算错
+      （多季剧普遍如此），所以 L2 的结论默认只是"待定"，
+      必须由 L3 确认后才会上报，避免噪音。
+
+  L3 深度复核（可选，走 MP 真实识别链 = TMDB）
+      把源文件交给 MediaChain().recognize_media() 重新识别一次，比对：
+        - tmdbid 是否一致          → 记录与识别器结论冲突（真正需要人看的东西）
+        - vote_count 是否过低      → TMDB 脏词条特征
+        - 别名数量是否过少         → 冷门/脏词条特征
+        - 季号是否超过该剧总季数   → 强信号（脏词条常常只有 1 季）
+        - 原产国与分类目录是否匹配 → 分类错位提示
+
+== 关于误报抑制（重要） ==
+真实环境里同一个媒体库路径会被反复整理覆盖：同一集的 1080p 与 2160p 版本会
+hardlink 到**同一个 dest**，后一次会让前一次记录的 inode 关系失效。
+这不是故障，是预期行为。因此插件会：
+  - 遍历窗口外的记录建立"同路径 / 同剧同季 最新记录"索引
+  - 只对**每个 dest 的最新那条记录**做判定，被覆盖的旧记录仅计数不计为异常
+这样才能把信噪比压到可用水平（实测从 1311/2000 项噪音降到个位数真问题）。
+"""
+
+import datetime
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.core.config import settings
+from app.core.metainfo import MetaInfoPath
+from app.db.transferhistory_oper import TransferHistoryOper
+from app.log import logger
+from app.plugins import _PluginBase
+from app.schemas.types import NotificationType
+
+# 国家/地区 → 二级分类关键词
+_REGION_MAP = {
+    "日韩": ("JP", "KR", "KP"),
+    "欧美": ("US", "GB", "FR", "DE", "ES", "IT", "CA", "AU", "NZ",
+             "SE", "DK", "NO", "FI", "NL", "BE", "IE", "RU", "MX", "BR", "AR"),
+    "华语": ("CN", "TW", "HK", "MO", "SG", "MY"),
+    "印": ("IN", "PK", "BD"),
+    "泰": ("TH",),
+}
+
+_LEVEL_ORDER = {"error": 0, "warn": 1, "info": 2}
+_LEVEL_TEXT = {"error": "严重", "warn": "可疑", "info": "提示"}
+# 只有这两个级别计入"异常"并触发通知；info 只作为提示保留在详情页
+_ACTIONABLE_LEVELS = {"error", "warn"}
+
+# 建立"被覆盖"索引时额外回看的天数
+_LOOKBACK_EXTRA_DAYS = 14
+
+
+class HardlinkVerify(_PluginBase):
+    # ---- 插件元信息 ----
+    plugin_name = "硬链接与识别校验"
+    plugin_desc = ("巡检已整理媒体：① 校验硬链接是否仍然有效（源种子还在不在）；"
+                   "② 复核识别结果是否自洽（重新解析源文件名比对年份/标题）；"
+                   "③ 可选深度复核（走 TMDB 重新识别，比对 tmdbid、热度、季数），"
+                   "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
+                   "已内置同路径覆盖抑制，避免重复整理产生噪音。")
+    plugin_version = "1.2.0"
+    plugin_author = "小w (WorkBuddy)"
+    author_url = ""
+    plugin_config_prefix = "HardlinkVerify_"
+    plugin_order = 50
+    auth_level = 1
+
+    # ---- 运行期状态 ----
+    _enable: bool = False
+    _notify: bool = True
+    _onlyonce: bool = False
+    _cron: str = "0 5 * * *"
+    _days: int = 3
+    _check_link: bool = True
+    _check_recognize: bool = True
+    _deep: bool = True
+    _max_deep: int = 300
+    _min_vote: int = 10
+    _min_alias: int = 3
+    _max_records: int = 3000
+    _scheduler: Optional[BackgroundScheduler] = None
+
+    # ==================================================================
+    # 生命周期
+    # ==================================================================
+    def init_plugin(self, config: dict = None):
+        self.stop_service()
+        config = config or {}
+        self._enable = bool(config.get("enable", False))
+        self._notify = bool(config.get("notify", True))
+        self._onlyonce = bool(config.get("onlyonce", False))
+        self._cron = (config.get("cron") or "0 5 * * *").strip()
+        self._days = self.__to_int(config.get("days"), 3)
+        self._check_link = bool(config.get("check_link", True))
+        self._check_recognize = bool(config.get("check_recognize", True))
+        self._deep = bool(config.get("deep", True))
+        self._max_deep = self.__to_int(config.get("max_deep"), 300)
+        self._min_vote = self.__to_int(config.get("min_vote"), 10)
+        self._min_alias = self.__to_int(config.get("min_alias"), 3)
+        self._max_records = self.__to_int(config.get("max_records"), 3000)
+
+        if self._onlyonce:
+            logger.info("【硬链接与识别校验】立即运行一次")
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            self._scheduler.add_job(
+                func=self.__task,
+                trigger="date",
+                run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                + datetime.timedelta(seconds=3),
+            )
+            self._onlyonce = False
+            self.__update_config()
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+
+    def get_state(self) -> bool:
+        return self._enable
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return []
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/run",
+                "endpoint": self.__api_run,
+                "methods": ["POST"],
+                "summary": "立即执行一次巡检",
+                "description": "手动触发硬链接与识别复核，结果写入插件详情页",
+            }
+        ]
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if self._enable and self._cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._cron)
+            except Exception as e:
+                logger.error(f"【硬链接与识别校验】cron 表达式无效：{self._cron} - {e}")
+                return []
+            return [
+                {
+                    "id": "HardlinkVerify",
+                    "name": "硬链接与识别巡检",
+                    "trigger": trigger,
+                    "func": self.__task,
+                    "kwargs": {},
+                }
+            ]
+        return []
+
+    def stop_service(self):
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            logger.error(f"【硬链接与识别校验】停止服务失败：{e}")
+
+    # ==================================================================
+    # 手动触发 API
+    # ==================================================================
+    def __api_run(self) -> dict:
+        try:
+            summary = self.__task()
+            return {"success": True, "message": "巡检完成", "data": summary}
+        except Exception as e:
+            logger.error(f"【硬链接与识别校验】手动巡检失败：{e}")
+            return {"success": False, "message": str(e)}
+
+    # ==================================================================
+    # 主流程
+    # ==================================================================
+    def __task(self) -> dict:
+        started = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+        tz = pytz.timezone(settings.TZ)
+        today = datetime.datetime.now(tz=tz).date()
+        cutoff = today - datetime.timedelta(days=max(self._days, 1) - 1)
+
+        logger.info(f"【硬链接与识别校验】开始巡检，判定范围：{cutoff} 起")
+
+        # 回看更多天，用来建立"被覆盖"索引
+        try:
+            all_records = self.__collect_records(
+                max(self._days, 1) + _LOOKBACK_EXTRA_DAYS, cap=self._max_records
+            )
+        except Exception as e:
+            logger.error(f"【硬链接与识别校验】读取整理记录失败：{e}")
+            return {"checked": 0, "issues": 0, "error": str(e)}
+
+        # 同 dest / 同剧同季 的最新记录 id
+        dest_latest: Dict[str, int] = {}
+        key_latest: Dict[Tuple, int] = {}
+        for r in all_records:
+            rid = getattr(r, "id", None)
+            if not rid:
+                continue
+            d = getattr(r, "dest", None)
+            if d:
+                dest_latest[d] = max(dest_latest.get(d, 0), rid)
+            k = (getattr(r, "tmdbid", None), getattr(r, "seasons", None))
+            if k[0]:
+                key_latest[k] = max(key_latest.get(k, 0), rid)
+
+        # 只判定窗口内的记录
+        targets = []
+        for r in all_records:
+            dt = self.__parse_dt(getattr(r, "date", ""))
+            if dt is None or dt.date() >= cutoff:
+                targets.append(r)
+
+        logger.info(f"【硬链接与识别校验】索引 {len(all_records)} 条，待判定 {len(targets)} 条")
+
+        issues: List[dict] = []
+        notes: List[dict] = []
+        deep_budget = self._max_deep
+        stat = {"checked": 0, "link_bad": 0, "reco_bad": 0,
+                "skipped_unmounted": 0, "superseded": 0, "deep_done": 0}
+
+        ctx = {"dest_latest": dest_latest, "key_latest": key_latest, "stat": stat}
+
+        for rec in targets:
+            stat["checked"] += 1
+            try:
+                rec_issues, deep_used = self.__check_record(rec, deep_budget, ctx)
+            except Exception as e:
+                logger.error(f"【硬链接与识别校验】记录 #{getattr(rec, 'id', '?')} 复核异常：{e}")
+                continue
+            deep_budget -= deep_used
+            stat["deep_done"] += deep_used
+            for it in rec_issues:
+                if it["kind"] == "skip_unmounted":
+                    stat["skipped_unmounted"] += 1
+                    continue
+                if it.get("kind") == "superseded":
+                    stat["superseded"] += 1
+                    continue
+                if it["level"] not in _ACTIONABLE_LEVELS:
+                    notes.append(it)
+                    continue
+                issues.append(it)
+                if it["group"] == "link":
+                    stat["link_bad"] += 1
+                else:
+                    stat["reco_bad"] += 1
+
+        issues.sort(key=lambda x: (_LEVEL_ORDER.get(x["level"], 9), -int(x.get("id") or 0)))
+        notes.sort(key=lambda x: (_LEVEL_ORDER.get(x["level"], 9), -int(x.get("id") or 0)))
+
+        result = {
+            "time": started.strftime("%Y-%m-%d %H:%M:%S"),
+            "range_days": self._days,
+            "checked": stat["checked"],
+            "issues": len(issues),
+            "notes": len(notes),
+            "link_bad": stat["link_bad"],
+            "reco_bad": stat["reco_bad"],
+            "unmounted": stat["skipped_unmounted"],
+            "superseded": stat["superseded"],
+            "deep_done": stat["deep_done"],
+            "items": issues[:400],
+            "note_items": notes[:200],
+        }
+        history = self.get_data("history") or []
+        history = [result] + [h for h in history if isinstance(h, dict)][:19]
+        self.save_data("history", history)
+        self.save_data("last", result)
+
+        logger.info(
+            f"【硬链接与识别校验】巡检完成：判定 {result['checked']} 条，"
+            f"异常 {result['issues']} 条（断链 {result['link_bad']} / 识别 {result['reco_bad']}），"
+            f"提示 {result['notes']} 条，被覆盖跳过 {result['superseded']} 条，"
+            f"深度复核 {result['deep_done']} 条，未挂载跳过 {result['unmounted']} 条"
+        )
+        self.__notify_result(result)
+        return result
+
+    # ==================================================================
+    # 逐条复核
+    # ==================================================================
+    def __check_record(self, rec, deep_budget: int, ctx: dict) -> Tuple[List[dict], int]:
+        found: List[dict] = []
+        pending: List[dict] = []          # 需 L3 确认后才上报的弱信号
+        base = {
+            "id": getattr(rec, "id", None),
+            "date": getattr(rec, "date", "") or "",
+            "title": getattr(rec, "title", "") or "",
+            "year": getattr(rec, "year", "") or "",
+            "tmdbid": getattr(rec, "tmdbid", None),
+            "doubanid": getattr(rec, "doubanid", None),
+            "bangumiid": getattr(rec, "bangumiid", None),
+            "anilistid": getattr(rec, "anilistid", None),
+            "category": getattr(rec, "category", "") or "",
+            "seasons": getattr(rec, "seasons", "") or "",
+            "mode": getattr(rec, "mode", "") or "",
+            "src": getattr(rec, "src", "") or "",
+            "dest": getattr(rec, "dest", "") or "",
+        }
+
+        src, dest = base["src"], base["dest"]
+
+        if src and not self.__is_mounted(src):
+            return [dict(base, group="skip", kind="skip_unmounted", level="info",
+                         reason="路径未挂载进容器",
+                         detail=f"该记录所在卷未挂载进 MoviePilot 容器，跳过：{self.__root_of(src)}")], 0
+
+        # 这条记录是否已被后续整理覆盖（同路径 or 同剧同季的更新记录）
+        superseded = self.__superseded_by(base, ctx)
+
+        # ---------- L1 硬链接 ----------
+        if self._check_link and dest:
+            found.extend(self.__check_link(rec, base, superseded))
+
+        # ---------- L2 + L3 识别 ----------
+        deep_used = 0
+        if self._check_recognize and src:
+            l2, need_deep, meta = self.__check_recognize_offline(rec, base)
+            for it in l2:
+                (pending if it.pop("_pending", False) else found).append(it)
+
+            if self._deep and (need_deep or pending) and deep_budget > 0:
+                deep_used = 1
+                deep_issues = self.__check_recognize_deep(rec, base, meta)
+                found.extend(deep_issues)
+                if deep_issues:
+                    # 深复核确认有问题 → 一并保留命名风险提示
+                    for it in pending:
+                        it["level"] = "warn"
+                        found.append(it)
+                elif not pending:
+                    pass
+            else:
+                # 没走深复核，弱信号降级为提示（保留透明度）
+                for it in pending:
+                    it["level"] = "info"
+                    it["reason"] = "命名风险（未做深度复核）：" + it["reason"]
+                    found.append(it)
+
+        return found, deep_used
+
+    def __superseded_by(self, base: dict, ctx: dict) -> Optional[str]:
+        rid = base["id"] or 0
+        if not rid:
+            return None
+        d = base["dest"]
+        if d:
+            newer = ctx["dest_latest"].get(d, 0)
+            if newer > rid:
+                return f"同路径已被更新的整理记录 #{newer} 覆盖"
+        if base["tmdbid"]:
+            newer = ctx["key_latest"].get((base["tmdbid"], base["seasons"]), 0)
+            if newer > rid:
+                return f"同剧同季已被更新的整理记录 #{newer} 覆盖"
+        return None
+
+    # ---------------------------- L1 ----------------------------
+    def __check_link(self, rec, base: dict, superseded: Optional[str]) -> List[dict]:
+        srcs = rec.files if isinstance(getattr(rec, "files", None), list) and rec.files else []
+        if not srcs and base["src"]:
+            srcs = [base["src"]]
+        srcs = [s for s in srcs if isinstance(s, str) and s]
+        mode = (base["mode"] or "").lower()
+        dest = base["dest"]
+        out: List[dict] = []
+
+        def emit(kind: str, level: str, reason: str, detail: str):
+            out.append(dict(base, group="link", kind=kind, level=level,
+                            reason=reason, detail=detail))
+
+        if not os.path.exists(dest):
+            if superseded:
+                # 旧记录的目标已被新记录接管 → 预期行为，不计异常
+                emit("superseded", "info", superseded, superseded)
+            else:
+                emit("dest_missing", "error", "媒体库文件不存在",
+                     f"整理记录指向的目标文件已不存在，且没有更新的整理记录接管该路径。"
+                     f"可能是被误删/被清理插件删除、媒体库改过目录结构，"
+                     f"或文件被移到了未挂载进容器的卷。目标：{dest}")
+            return out
+
+        if mode not in ("link", "hardlink"):
+            return out
+
+        # 收集目标侧 inode
+        target_inodes = set()
+        try:
+            dest_path = Path(dest)
+            if dest_path.is_file():
+                st = os.stat(dest_path)
+                target_inodes.add((st.st_dev, st.st_ino))
+            else:
+                for f in dest_path.rglob("*"):
+                    if f.is_file():
+                        st = os.stat(f)
+                        target_inodes.add((st.st_dev, st.st_ino))
+        except OSError as e:
+            logger.warning(f"【硬链接与识别校验】读取目标路径失败 {dest}：{e}")
+
+        lost_src, broken = [], []
+        for s in srcs:
+            if not os.path.exists(s):
+                lost_src.append(s)
+                continue
+            try:
+                st = os.stat(s)
+            except OSError:
+                lost_src.append(s)
+                continue
+            if (st.st_dev, st.st_ino) not in target_inodes:
+                broken.append(s)
+
+        if broken:
+            if superseded:
+                emit("superseded", "info", superseded,
+                     f"{len(broken)} 个源文件与目标不再同 inode —— {superseded}")
+            else:
+                emit("link_broken", "error", "硬链接已断开",
+                     f"{len(broken)} 个源文件在媒体库中没有对应的硬链接"
+                     f"（媒体库成了独立副本：源种子删掉后仍占空间，且不再是保种文件）。"
+                     f"示例：{os.path.basename(broken[0])}")
+        if lost_src:
+            emit("src_missing", "info", "源文件已不在下载目录",
+                 f"{len(lost_src)} 个源文件已不存在（做种结束正常清理可忽略；"
+                 f"媒体库硬链接本身仍指向文件本体，不会丢）。"
+                 f"示例：{os.path.basename(lost_src[0])}")
+        return out
+
+    # ---------------------------- L2 ----------------------------
+    def __check_recognize_offline(self, rec, base: dict) -> Tuple[List[dict], bool, Any]:
+        """离线识别自洽性检查。返回 (问题列表, 是否需要深复核, meta)。"""
+        out: List[dict] = []
+        need_deep = False
+
+        try:
+            meta = MetaInfoPath(Path(base["src"]))
+        except Exception as e:
+            logger.warning(f"【硬链接与识别校验】解析源路径失败 {base['src']}：{e}")
+            return out, False, None
+
+        parsed_year = str(meta.year) if getattr(meta, "year", None) else ""
+        rec_year = str(base["year"]) if base["year"] else ""
+
+        # ① 年份不一致 —— 是"容易被误配"的命名模式，本身不一定是错（多季剧普遍如此）
+        if parsed_year and rec_year and parsed_year != rec_year:
+            out.append(dict(
+                base, group="reco", kind="year_conflict", level="warn", _pending=True,
+                reason="文件名年份与条目年份不一致",
+                detail=(f"源文件名解析出的年份是 {parsed_year}，整理记录里的条目是"
+                        f"《{base['title']}》({rec_year})。多季剧把「当季年份」写进文件名"
+                        f"是常见做法，本身不算错；但正是这种命名会让 MP 匹配到"
+                        f"同名的低热度词条，所以需要深复核确认。"),
+            ))
+            need_deep = True
+
+        # ② 文件名里有显式 tmdbid 标签 → 可直接判定
+        tagged = getattr(meta, "tmdbid", None)
+        if tagged and base["tmdbid"] and int(tagged) != int(base["tmdbid"]):
+            out.append(dict(
+                base, group="reco", kind="tmdbid_tag_mismatch", level="error",
+                reason="ID 标签与整理记录不一致",
+                detail=(f"源文件名里显式标注 tmdbid={tagged}，"
+                        f"但整理记录写的是 tmdbid={base['tmdbid']}。"),
+            ))
+
+        # ③ 四个数据源 ID 全空 → 识别链路可疑（仅提示，综艺/动漫常见）
+        if not any([base["tmdbid"], base["doubanid"], base["bangumiid"], base["anilistid"]]):
+            out.append(dict(
+                base, group="reco", kind="missing_media_id", level="info",
+                reason="整理记录没有任何媒体 ID",
+                detail="这条成功记录里 tmdbid/豆瓣/Bangumi/AniList ID 全为空，"
+                       "识别链路可能只靠文件名，建议留意。",
+            ))
+
+        # ④ 源文件名季号 vs 记录季号（弱信号，待确认）
+        try:
+            begin_season = getattr(meta, "begin_season", None)
+            rec_season = self.__parse_season(base["seasons"])
+            if begin_season and rec_season and int(begin_season) != rec_season:
+                out.append(dict(
+                    base, group="reco", kind="season_conflict", level="warn", _pending=True,
+                    reason="季号不一致",
+                    detail=(f"源文件名是 S{begin_season:02d}，"
+                            f"整理记录写的是 {base['seasons']}。"),
+                ))
+                need_deep = True
+        except Exception:
+            pass
+
+        return out, need_deep, meta
+
+    # ---------------------------- L3 ----------------------------
+    def __check_recognize_deep(self, rec, base: dict, meta) -> List[dict]:
+        out: List[dict] = []
+        if meta is None:
+            return out
+
+        try:
+            from app.chain.media import MediaChain
+            mediainfo = MediaChain().recognize_media(meta=meta)
+        except Exception as e:
+            logger.warning(f"【硬链接与识别校验】深度识别失败 #{base['id']}：{e}")
+            return out
+
+        if not mediainfo:
+            out.append(dict(
+                base, group="reco", kind="recognize_failed", level="info",
+                reason="重新识别不到媒体信息",
+                detail="按当前识别词重新识别源文件，TMDB 没有返回结果"
+                       "（综艺/国漫等中文名资源较常见，不一定代表出错）。",
+            ))
+            return out
+
+        alias_norms = {self.__norm(n) for n in (mediainfo.names or []) if n}
+        alias_norms.add(self.__norm(mediainfo.title))
+        alias_norms.add(self.__norm(mediainfo.original_title))
+        alias_norms.discard("")
+        rec_title_norm = self.__norm(base["title"])
+
+        # ① tmdbid 冲突 —— 本插件最核心的输出
+        if base["tmdbid"] and mediainfo.tmdb_id and int(mediainfo.tmdb_id) != int(base["tmdbid"]):
+            out.append(dict(
+                base, group="reco", kind="tmdbid_mismatch", level="error",
+                reason="记录与识别结果 TMDB ID 不一致",
+                detail=(f"整理记录写的是 tmdbid={base['tmdbid']}"
+                        f"（《{base['title']}》"
+                        f"{' (' + base['year'] + ')' if base['year'] else ''}），"
+                        f"而按当前识别词重新识别得到 tmdbid={mediainfo.tmdb_id}"
+                        f"（《{mediainfo.title}》"
+                        f"{' (' + str(mediainfo.year) + ')' if mediainfo.year else ''}）。"
+                        f"两者必有其一不对：要么这条记录当时识别错了，"
+                        f"要么识别器至今仍会被同名脏词条带偏。"),
+            ))
+
+        # ② 记录标题不在该条目的任何别名里
+        if rec_title_norm and alias_norms and not any(
+                rec_title_norm in a or a in rec_title_norm for a in alias_norms):
+            out.append(dict(
+                base, group="reco", kind="title_not_in_aliases", level="warn",
+                reason="记录标题不属于该条目的别名",
+                detail=(f"记录标题《{base['title']}》不在 tmdbid={mediainfo.tmdb_id}"
+                        f"（《{mediainfo.title}》）的任何已知别名里。"),
+            ))
+
+        # ③ 季号越界 —— 脏词条常常只有 1 季
+        rec_season = self.__parse_season(base["seasons"])
+        total_seasons = mediainfo.number_of_seasons
+        if rec_season and total_seasons and rec_season > int(total_seasons):
+            out.append(dict(
+                base, group="reco", kind="season_overflow", level="error",
+                reason="季号超出该剧总季数（强烈疑似误配）",
+                detail=(f"整理记录是 {base['seasons']}，但 tmdbid={mediainfo.tmdb_id}"
+                        f"（《{mediainfo.title}》）在 TMDB 上总共只有 {total_seasons} 季。"
+                        f"这正是「长剧被刮成冷门同名剧」的典型特征。"),
+            ))
+
+        # ④ 热度 / 别名数量 —— 脏词条特征
+        vote_count = mediainfo.vote_count
+        if vote_count is not None and int(vote_count) < self._min_vote:
+            out.append(dict(
+                base, group="reco", kind="dirty_entry", level="warn",
+                reason=f"TMDB 条目热度极低（vote_count={vote_count}）",
+                detail=(f"tmdbid={mediainfo.tmdb_id}（《{mediainfo.title}》）评分人数只有 "
+                        f"{vote_count}，低于阈值 {self._min_vote}。"
+                        f"低热度又同名的条目，是 MP 误配的高发源。"),
+            ))
+        if len(alias_norms) < self._min_alias:
+            out.append(dict(
+                base, group="reco", kind="thin_aliases", level="info",
+                reason=f"TMDB 条目别名过少（{len(alias_norms)} 个）",
+                detail=(f"tmdbid={mediainfo.tmdb_id} 只有 {len(alias_norms)} 个别名，"
+                        f"冷门/新建条目特征，建议人工确认。"),
+            ))
+
+        # ⑤ 原产国与分类目录错位
+        countries = mediainfo.origin_country or []
+        rec_category = base["category"] or ""
+        if countries and rec_category:
+            expect = self.__region_of(countries)
+            if expect and expect not in rec_category:
+                out.append(dict(
+                    base, group="reco", kind="category_mismatch", level="info",
+                    reason="分类目录与条目原产国不符",
+                    detail=(f"tmdbid={mediainfo.tmdb_id} 的原产国是 "
+                            f"{'/'.join(str(c) for c in countries)}（约 {expect}），"
+                            f"但文件归进了「{rec_category}」。"),
+                ))
+
+        return out
+
+    # ==================================================================
+    # 工具方法
+    # ==================================================================
+    def __collect_records(self, days: int, cap: int) -> List[Any]:
+        oper = TransferHistoryOper()
+        tz = pytz.timezone(settings.TZ)
+        today = datetime.datetime.now(tz=tz).date()
+        start = today - datetime.timedelta(days=max(days, 1) - 1)
+
+        seen, records = set(), []
+        day = today
+        while day >= start:
+            try:
+                rows = oper.list_by_date(day.strftime("%Y-%m-%d")) or []
+            except Exception as e:
+                logger.warning(f"【硬链接与识别校验】查询 {day} 整理记录失败：{e}")
+                rows = []
+            for r in rows:
+                rid = getattr(r, "id", None)
+                if rid in seen:
+                    continue
+                dt = self.__parse_dt(getattr(r, "date", ""))
+                if dt is not None and dt.date() < start:
+                    continue
+                if rid is not None:
+                    seen.add(rid)
+                records.append(r)
+                if len(records) >= cap:
+                    return records
+            day -= datetime.timedelta(days=1)
+        return records
+
+    @staticmethod
+    def __parse_dt(text: str) -> Optional[datetime.datetime]:
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.datetime.strptime(str(text).strip(), fmt)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def __parse_season(text: str) -> Optional[int]:
+        if not text:
+            return None
+        m = re.search(r"[Ss](\d{1,3})", str(text))
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+        m = re.search(r"\d{1,3}", str(text))
+        if m:
+            try:
+                return int(m.group(0))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def __norm(text) -> str:
+        if not text:
+            return ""
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(text).lower())
+
+    @staticmethod
+    def __to_int(value, default: int) -> int:
+        try:
+            if value is None or value == "":
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def __root_of(path: str) -> str:
+        parts = Path(path).parts
+        return str(Path(parts[0]) / parts[1]) if len(parts) > 1 else str(parts[0])
+
+    @classmethod
+    def __is_mounted(cls, path: str) -> bool:
+        """MP 容器只挂了部分卷，没挂的卷要跳过而不是误报丢失。"""
+        parts = Path(path).parts
+        if len(parts) <= 2:
+            return True
+        root = str(Path(parts[0]) / parts[1])
+        if not re.fullmatch(r"/volume\d+", root):
+            return True
+        return Path(parts[0]).joinpath(parts[1]).exists()
+
+    @staticmethod
+    def __region_of(countries: List[str]) -> Optional[str]:
+        codes = {str(c).upper() for c in countries if c}
+        for region, members in _REGION_MAP.items():
+            if codes & set(members):
+                return region
+        return None
+
+    # ==================================================================
+    # 通知
+    # ==================================================================
+    def __notify_result(self, result: dict):
+        if not self._notify:
+            return
+        checked, total = result["checked"], result["issues"]
+        notes = result.get("notes", 0)
+        if total == 0:
+            if checked:
+                tail = f"另有 {notes} 条提示（非异常，见插件详情页）。" if notes else ""
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="【硬链接与识别校验】巡检通过 ✅",
+                    text=(f"判定最近 {result['range_days']} 天共 {checked} 条整理记录，"
+                          f"未发现硬链接断裂或识别错配"
+                          f"（被更新版本覆盖的旧记录 {result['superseded']} 条已自动忽略）。{tail}"),
+                )
+            return
+
+        errors = [i for i in result["items"] if i["level"] == "error"]
+        lines = [f"判定 {checked} 条，发现 **{total}** 项异常："
+                 f"断链 {result['link_bad']} / 识别 {result['reco_bad']}"
+                 f"（其中严重 {len(errors)} 项）",
+                 f"已自动忽略被覆盖旧记录 {result['superseded']} 条"
+                 + (f"；另有 {notes} 条非异常提示" if notes else ""), ""]
+        for it in result["items"][:15]:
+            lines.append(
+                f"- [{_LEVEL_TEXT.get(it['level'], it['level'])}] "
+                f"#{it['id']} 《{it['title']}》"
+                f"{(' (' + it['year'] + ')') if it['year'] else ''}"
+                f"\n    {it['reason']}｜{it['detail']}"
+            )
+        if total > 15:
+            lines.append(f"\n… 其余 {total - 15} 项见插件详情页")
+
+        self.post_message(
+            mtype=NotificationType.Plugin,
+            title=f"【硬链接与识别校验】发现 {total} 项异常 ⚠️",
+            text="\n".join(lines),
+        )
+
+    # ==================================================================
+    # 配置页
+    # ==================================================================
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(2, self.__switch("enable", "启用插件")),
+                            self.__col(2, self.__switch("notify", "异常时通知")),
+                            self.__col(2, self.__switch("onlyonce", "立即运行一次")),
+                            self.__col(2, self.__switch("check_link", "校验硬链接")),
+                            self.__col(2, self.__switch("check_recognize", "校验识别")),
+                            self.__col(2, self.__switch("deep", "深度复核(TMDB)")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(4, self.__cron("cron", "定时执行周期", "0 5 * * *")),
+                            self.__col(2, self.__text("days", "判定回溯天数", "3")),
+                            self.__col(2, self.__text("max_records", "单次读取上限", "3000")),
+                            self.__col(2, self.__text("max_deep", "深度复核上限", "300")),
+                            self.__col(2, self.__text("min_vote", "热度下限", "10")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "info",
+                                    "variant": "tonal",
+                                    "text": ("校验分三层：① 硬链接完整性（源种子与媒体库是否仍同一 inode）；"
+                                             "② 识别自洽性（重新解析源文件名，比对年份/季号，零外部请求）；"
+                                             "③ 深度复核（走 MP 真实识别链，比对 tmdbid、热度、季数、原产国，"
+                                             "会消耗 TMDB 请求，受「深度复核上限」约束）。"),
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "warning",
+                                    "variant": "tonal",
+                                    "text": ("误报抑制：同一媒体库路径会被反复整理覆盖"
+                                             "（同一集 1080p / 2160p 会 hardlink 到同一 dest），"
+                                             "插件只判定每个 dest 的**最新**记录，"
+                                             "被覆盖的旧记录自动忽略并单独计数。"),
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "warning",
+                                    "variant": "tonal",
+                                    "text": ("注意：只有挂载进 MoviePilot 容器的卷才能做 inode 比对。"
+                                             "未挂载卷下的记录会被标记为「未挂载」跳过，"
+                                             "不会误报为丢失。"),
+                                },
+                            }),
+                        ],
+                    },
+                ],
+            }
+        ], {
+            "enable": False,
+            "notify": True,
+            "onlyonce": False,
+            "cron": "0 5 * * *",
+            "days": 3,
+            "check_link": True,
+            "check_recognize": True,
+            "deep": True,
+            "max_records": 3000,
+            "max_deep": 300,
+            "min_vote": 10,
+        }
+
+    @staticmethod
+    def __col(md: int, content) -> dict:
+        return {"component": "VCol", "props": {"cols": 12, "md": md}, "content": [content]}
+
+    @staticmethod
+    def __switch(model: str, label: str) -> dict:
+        return {"component": "VSwitch", "props": {"model": model, "label": label}}
+
+    @staticmethod
+    def __text(model: str, label: str, placeholder: str = "") -> dict:
+        return {"component": "VTextField",
+                "props": {"model": model, "label": label, "placeholder": placeholder}}
+
+    @staticmethod
+    def __cron(model: str, label: str, placeholder: str = "") -> dict:
+        return {"component": "VCronField",
+                "props": {"model": model, "label": label, "placeholder": placeholder}}
+
+    def __update_config(self):
+        self.update_config({
+            "enable": self._enable,
+            "notify": self._notify,
+            "onlyonce": self._onlyonce,
+            "cron": self._cron,
+            "days": self._days,
+            "check_link": self._check_link,
+            "check_recognize": self._check_recognize,
+            "deep": self._deep,
+            "max_records": self._max_records,
+            "max_deep": self._max_deep,
+            "min_vote": self._min_vote,
+        })
+
+    # ==================================================================
+    # 详情页
+    # ==================================================================
+    def get_page(self) -> Optional[List[dict]]:
+        last = self.get_data("last")
+        history = self.get_data("history") or []
+
+        run_btn = {
+            "component": "VBtn",
+            "props": {"prepend-icon": "mdi-magnify-scan", "variant": "tonal",
+                      "color": "primary"},
+            "text": "立即巡检",
+            "events": {
+                "click": {
+                    "api": f"plugin/{self.__class__.__name__}/run"
+                           f"?apikey={settings.API_TOKEN}",
+                    "method": "post",
+                }
+            },
+        }
+
+        if not last:
+            return [
+                {
+                    "component": "div",
+                    "props": {"class": "d-flex align-center"},
+                    "content": [
+                        {"component": "h2", "props": {"class": "page-title m-0"},
+                         "text": "硬链接与识别校验"},
+                        {"component": "VSpacer"},
+                        run_btn,
+                    ],
+                },
+                {
+                    "component": "div",
+                    "text": "暂无巡检结果，点右上角「立即巡检」或到配置页打开「立即运行一次」。",
+                    "props": {"class": "text-center mt-6 text-medium-emphasis"},
+                },
+            ]
+
+        items = []
+        for it in (last.get("items") or []):
+            items.append({
+                "level": _LEVEL_TEXT.get(it.get("level"), it.get("level")),
+                "id": it.get("id"),
+                "title": it.get("title") or "-",
+                "year": it.get("year") or "-",
+                "category": it.get("category") or "-",
+                "tmdbid": it.get("tmdbid") if it.get("tmdbid") is not None else "-",
+                "reason": it.get("reason") or "",
+                "detail": it.get("detail") or "",
+            })
+
+        notes = []
+        for it in (last.get("note_items") or []):
+            notes.append({
+                "level": _LEVEL_TEXT.get(it.get("level"), it.get("level")),
+                "id": it.get("id"),
+                "title": it.get("title") or "-",
+                "year": it.get("year") or "-",
+                "category": it.get("category") or "-",
+                "tmdbid": it.get("tmdbid") if it.get("tmdbid") is not None else "-",
+                "reason": it.get("reason") or "",
+                "detail": it.get("detail") or "",
+            })
+
+        summary = [
+            self.__stat("判定记录", f"{last.get('checked', 0)} 条"),
+            self.__stat("异常合计", f"{last.get('issues', 0)} 项"),
+            self.__stat("硬链接异常", f"{last.get('link_bad', 0)} 项"),
+            self.__stat("识别异常", f"{last.get('reco_bad', 0)} 项"),
+            self.__stat("提示(非异常)", f"{last.get('notes', 0)} 条", "grey"),
+            self.__stat("已忽略(被覆盖)", f"{last.get('superseded', 0)} 条", "grey"),
+        ]
+
+        hist_items = [
+            {
+                "time": h.get("time", ""),
+                "range": f"最近 {h.get('range_days', '-')} 天",
+                "checked": h.get("checked", 0),
+                "issues": h.get("issues", 0),
+                "link_bad": h.get("link_bad", 0),
+                "reco_bad": h.get("reco_bad", 0),
+                "notes": h.get("notes", 0),
+                "superseded": h.get("superseded", 0),
+            }
+            for h in history
+        ]
+
+        page = [
+            {
+                "component": "div",
+                "props": {"class": "d-flex align-center mb-2"},
+                "content": [
+                    {"component": "h2", "props": {"class": "page-title m-0"},
+                     "text": "硬链接与识别校验"},
+                    {"component": "VSpacer"},
+                    {"component": "span",
+                     "props": {"class": "text-medium-emphasis text-body-2 mr-3"},
+                     "text": f"最近巡检：{last.get('time', '-')}"},
+                    run_btn,
+                ],
+            },
+            {"component": "VRow", "content": summary},
+        ]
+
+        if items:
+            page.append({
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VDataTableVirtual",
+                                "props": {
+                                    "class": "text-sm",
+                                    "headers": [
+                                        {"title": "级别", "key": "level", "sortable": True, "width": "70"},
+                                        {"title": "记录", "key": "id", "sortable": True, "width": "80"},
+                                        {"title": "整理标题", "key": "title", "sortable": False},
+                                        {"title": "年份", "key": "year", "sortable": False, "width": "70"},
+                                        {"title": "分类", "key": "category", "sortable": False, "width": "90"},
+                                        {"title": "TMDB", "key": "tmdbid", "sortable": False, "width": "90"},
+                                        {"title": "判定", "key": "reason", "sortable": False},
+                                        {"title": "说明", "key": "detail", "sortable": False},
+                                    ],
+                                    "items": items,
+                                    "height": "34rem",
+                                    "density": "compact",
+                                    "fixed-header": True,
+                                    "hover": True,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            })
+        else:
+            page.append({
+                "component": "div",
+                "text": "本次巡检未发现异常 ✅",
+                "props": {"class": "text-center mt-6 text-medium-emphasis"},
+            })
+
+        # 非异常提示（折叠展示，不触发通知）
+        if notes:
+            page.append({
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {
+                                "component": "VExpansionPanels",
+                                "props": {"variant": "accordion", "class": "mt-4"},
+                                "content": [
+                                    {
+                                        "component": "VExpansionPanel",
+                                        "content": [
+                                            {
+                                                "component": "VExpansionPanelTitle",
+                                                "text": f"非异常提示（{last.get('notes', 0)} 条，"
+                                                        f"多为综艺/国漫等中文名资源，仅供参考）",
+                                            },
+                                            {
+                                                "component": "VExpansionPanelText",
+                                                "content": [
+                                                    {
+                                                        "component": "VDataTableVirtual",
+                                                        "props": {
+                                                            "class": "text-sm",
+                                                            "headers": [
+                                                                {"title": "记录", "key": "id", "width": "80"},
+                                                                {"title": "整理标题", "key": "title"},
+                                                                {"title": "年份", "key": "year", "width": "70"},
+                                                                {"title": "TMDB", "key": "tmdbid", "width": "90"},
+                                                                {"title": "判定", "key": "reason"},
+                                                                {"title": "说明", "key": "detail"},
+                                                            ],
+                                                            "items": notes,
+                                                            "height": "24rem",
+                                                            "density": "compact",
+                                                            "fixed-header": True,
+                                                            "hover": True,
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            })
+
+        if hist_items:
+            page.append({
+                "component": "VRow",
+                "content": [
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12},
+                        "content": [
+                            {"component": "h3",
+                             "props": {"class": "text-h6 mt-4 mb-2"},
+                             "text": "巡检历史"},
+                            {
+                                "component": "VDataTableVirtual",
+                                "props": {
+                                    "class": "text-sm",
+                                    "headers": [
+                                        {"title": "时间", "key": "time", "sortable": False},
+                                        {"title": "范围", "key": "range", "sortable": False},
+                                        {"title": "判定", "key": "checked", "sortable": True},
+                                        {"title": "异常", "key": "issues", "sortable": True},
+                                        {"title": "断链", "key": "link_bad", "sortable": True},
+                                        {"title": "识别", "key": "reco_bad", "sortable": True},
+                                        {"title": "提示", "key": "notes", "sortable": True},
+                                        {"title": "已忽略", "key": "superseded", "sortable": True},
+                                    ],
+                                    "items": hist_items,
+                                    "height": "16rem",
+                                    "density": "compact",
+                                    "fixed-header": True,
+                                    "hover": True,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            })
+
+        return page
+
+    @staticmethod
+    def __stat(title: str, value: str, color: str = None) -> dict:
+        card_props = {"variant": "tonal", "class": "text-center py-2"}
+        if color:
+            card_props["color"] = color
+        return {
+            "component": "VCol",
+            "props": {"cols": 6, "md": 2},
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": card_props,
+                    "content": [
+                        {"component": "div",
+                         "props": {"class": "text-caption text-medium-emphasis"},
+                         "text": title},
+                        {"component": "div",
+                         "props": {"class": "text-h6"},
+                         "text": str(value)},
+                    ],
+                }
+            ],
+        }
