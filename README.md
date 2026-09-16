@@ -55,22 +55,71 @@ hardlink 到**同一个 dest**，后一次会让前一次记录的 inode 关系�
 
 ```
 MoviePilot-Plugins/
-├── package.v2.json           # 插件市场索引（MoviePilot v2 读取这个）
-├── package.json              # 兼容索引（含 "v2": true 声明）
+├── package.v2.json                 # 插件市场索引（MoviePilot v2 读这个）
+├── package.json                    # 兼容索引（含 "v2": true 声明）
 ├── icons/
-│   └── hardlinkverify.png    # 插件图标（512×512）
-└── plugins/
-    └── hardlinkverify/       # 目录名 = 插件ID小写（必须）
-        └── __init__.py
+│   └── hardlinkverify.png          # 插件图标（512×512）
+├── plugins.v2/                     # ★ v2 安装源（MP 实际从这里取包）
+│   └── hardlinkverify/             #   目录名 = 插件ID小写（必须）
+│       └── __init__.py
+├── plugins/                        # v1 兜底目录（内容与 plugins.v2 一致）
+│   └── hardlinkverify/
+│       └── __init__.py
+└── tools/
+    ├── set_owner.py
+    └── sync_plugins.py             # 保证上面两个目录一致
 ```
 
-MoviePilot 的取包方式（以 `settings.VERSION_FLAG=v2` 为例）：
+### ⚠️ 关键：v2 市场的源码目录是 `plugins.v2/`，不是 `plugins/`
 
-1. 市场索引：`https://raw.githubusercontent.com/{user}/{repo}/main/package.v2.json`
-2. 文件清单：`https://api.github.com/repos/{user}/{repo}/contents/plugins`
-3. 文件内容：`https://raw.githubusercontent.com/{user}/{repo}/main/...`
+这是本仓库踩过的坑，写清楚免得再犯。MoviePilot 取包时按
+`app/helper/plugin.py::__async_get_file_list()` 这样拼 URL：
 
-所以 `plugins/<插件ID小写>/` 这个层级是**硬要求**，不能省。
+```python
+file_api = f"https://api.github.com/repos/{user_repo}/contents/plugins"
+if package_version:                      # package_version 来自 VERSION_FLAG，v2 时 = "v2"
+    file_api += f".{package_version}"    # → "plugins.v2"
+file_api += f"/{pid.lower()}"
+```
+
+所以：
+
+| 索引 | `package_version` | MP 实际请求的目录 |
+|---|---|---|
+| `package.v2.json` 里有该插件 | `"v2"` | **`contents/plugins.v2/<pid>/`** |
+| 只在 `package.json` 里声明 `"v2": true` | `""` | `contents/plugins/<pid>/` |
+
+因为 `package.v2.json` 优先命中，本仓库走第一行 —— **源码必须放 `plugins.v2/`**。
+放错目录的症状是安装时报：
+
+```
+连接仓库失败：404 - {"message":"Not Found",
+  "documentation_url":"https://docs.github.com/rest/repos/contents#get-repository-content"}
+```
+
+（注意：市场**列表**能正常显示插件，只有点「安装」时才 404 —— 因为列表只读
+`package.v2.json`，取包才走 `contents` API。）
+
+下载落地时会做一次路径改写 `replace("plugins.v2", "plugins")`，
+所以文件最终仍落在容器的 `/app/app/plugins/<pid>/` 下 —— 目录名只是**仓库侧的约定**。
+
+官方与几个主流第三方 v2 市场（`jxxghp` / `thsrite` / `InfinityPacer` / `DDSRem-Dev` /
+`hotlcc`）都是这个结构，可以自行核对。
+
+### 索引与图标地址
+
+1. 市场索引：`https://raw.githubusercontent.com/{user}/{repo}/main/package.{版本}.json`
+   （v2 时是 `package.v2.json`，取不到会回落 `package.json`）
+2. 文件清单：`https://api.github.com/repos/{user}/{repo}/contents/plugins.v2/{pid}`
+3. 文件内容：清单里每项的 `download_url`（即 `raw.githubusercontent.com/...`）
+
+改完源码记得跑一次同步，让两个目录一致：
+
+```bash
+python tools/sync_plugins.py           # 以 plugins.v2 为准覆盖 plugins
+python tools/sync_plugins.py --check   # 只校验，不一致退出码 1
+```
+
 
 ---
 
