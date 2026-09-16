@@ -83,8 +83,9 @@ class HardlinkVerify(_PluginBase):
                    "③ 可选深度复核（走 TMDB 重新识别，比对 tmdbid、热度、季数），"
                    "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
                    "已内置同路径覆盖抑制，避免重复整理产生噪音。")
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_author = "spizmm"
+    plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
     plugin_config_prefix = "HardlinkVerify_"
     plugin_order = 50
