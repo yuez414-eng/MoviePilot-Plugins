@@ -119,6 +119,22 @@ L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing
 `Base.delete()` = `db.query(cls).filter(id == rid).delete()`，
 **纯数据库行删除，不触碰磁盘**。做种源文件、媒体库母本、刮削产物全部不受影响。
 每条被删记录都会把整行快照写进插件数据 `prune_log`（保留最近 10 轮），可翻查/可恢复。
+
+== 别人装上就能用吗？—— 不需要填任何路径，但有三个自动生效的前提 ==
+
+本插件**没有任何"路径"配置项**，判定数据 100% 来自 MoviePilot 自己的 `transferhistory`
+表（打开「校验硬链接」后，还会对已硬链接的文件做真实 inode 比对）。所以：
+
+  1. **必须挂载进容器**：下载目录和媒体库目录都要挂进 MoviePilot 容器。
+     这是唯一真正的部署前提 —— 容器看不见的卷，`os.path.exists` 一律返回 False，
+     插件会把它判为「未挂载」并跳过（`skip_unmounted`），既不误报丢失，也绝不删记录。
+     判定依据是容器真实的挂载表 `/proc/mounts`，不依赖任何特定 NAS 的目录布局。
+  2. **整理模式必须是 link / hardlink**：`mode` 是 copy / move 的记录没有硬链接可比，
+     inode 校验层会直接跳过（这类记录仍会参与「目标文件是否存在」的检查）。
+  3. **记录必须落在判定窗口内**：默认只看最近 3 天（`days=3`）的整理记录。
+     想盘一遍存量库，把 `days` 调大（如 3650）跑一次再调回来即可。
+     另外插件默认**不启用**（`enable=false`），装完要到配置页打开。
+
 """
 
 import datetime
@@ -173,8 +189,11 @@ class HardlinkVerify(_PluginBase):
                    "以及「年份差未获强佐证时不升级为异常」（含 TMDB 同名条目唯一性判定）。"
                    "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。"
                    "可选「自动清理僵尸整理记录」：源与目标都已不存在的残留记录（清理插件不会删它们）"
-                   "从数据库里清掉，只删记录不删文件，默认关闭。")
-    plugin_version = "1.5.0"
+                   "从数据库里清掉，只删记录不删文件，默认关闭。"
+                   "无需填写任何路径 —— 判定数据全部来自 MoviePilot 自己的整理记录；"
+                   "前提是下载目录与媒体库目录都已挂载进 MoviePilot 容器"
+                   "（容器看不到的卷会被识别为「未挂载」并跳过，不会误报也不误删）。")
+    plugin_version = "1.5.1"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
@@ -203,6 +222,7 @@ class HardlinkVerify(_PluginBase):
     _prune_used: int = 0
     _prune_stamp: str = ""
     _tmdb_api: Any = None
+    _mount_points_cache: Optional[Tuple[str, ...]] = None
     _scheduler: Optional[BackgroundScheduler] = None
 
     # ==================================================================
@@ -1201,15 +1221,69 @@ class HardlinkVerify(_PluginBase):
         return str(Path(parts[0]) / parts[1]) if len(parts) > 1 else str(parts[0])
 
     @classmethod
+    def __mount_points(cls) -> Tuple[str, ...]:
+        """
+        容器内真实挂载点列表（按长度倒序，最长的优先匹配）。
+
+        为什么不用「猜目录名」而读 /proc/mounts：挂载点才是容器能不能看见某个卷的
+        唯一事实来源。绿联是 /volume3/HDD_03、群晖是 /volume1/media、常见的 Docker
+        部署是 /data/download 或 /mnt/media —— 硬编码任何一种布局，都会在别的布局上
+        把护栏悄悄变成空操作（''看不见'' 被误当成 ''不存在''）。
+
+        读不到就返回空元组，由 __is_mounted 走退化逻辑。结果缓存到类属性，只读一次。
+        """
+        if cls._mount_points_cache is None:
+            pts = []
+            try:
+                with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].startswith("/"):
+                            pts.append(parts[1].rstrip("/") or "/")
+            except OSError as e:
+                logger.warning(f"【硬链接与识别校验】读取 /proc/mounts 失败：{e}")
+            # 去掉容器根（overlay 是所有路径的前缀，没有判别力）
+            pts = sorted({p for p in pts if p != "/"}, key=len, reverse=True)
+            cls._mount_points_cache = tuple(pts)
+        return cls._mount_points_cache
+
+    @classmethod
     def __is_mounted(cls, path: str) -> bool:
-        """MP 容器只挂了部分卷，没挂的卷要跳过而不是误报丢失。"""
+        """
+        判断「这个路径落在容器看得见的卷上吗」—— 用来区分
+        「文件真的不存在」与「这个卷根本没挂进容器」。
+
+        这条区分是硬需求：容器里的 os.path.exists 对没挂载的卷一律返回 False，
+        任何「文件不存在 → 就认为它没了」的逻辑（尤其删记录）都必须先过这道闸，
+        否则未挂载卷下的活数据会被当成垃圾。
+
+        判据顺序：
+          1. 路径存在 → 一定可见（存在本身就证明挂载正常）；
+          2. 路径落在某个真实挂载点（非容器根）之下 → 可见，只是文件真没了；
+          3. 都不满足 → 判为「容器看不见这个卷」，调用方应跳过而不是下结论。
+        退路：读不到 /proc/mounts 时，沿用「一级目录是否存在」的宽松口径
+        （宁可多报，也不误删）。
+        """
+        if not path:
+            return False
+        if os.path.exists(path):
+            return True
+
+        pts = cls.__mount_points()
+        if pts:
+            p = str(Path(path))
+            for mp in pts:
+                if p == mp or p.startswith(mp + "/"):
+                    return True
+            return False
+
         parts = Path(path).parts
         if len(parts) <= 2:
             return True
         root = str(Path(parts[0]) / parts[1])
         if not re.fullmatch(r"/volume\d+", root):
             return True
-        return Path(parts[0]).joinpath(parts[1]).exists()
+        return Path(root).exists()
 
     @staticmethod
     def __region_of(countries: List[str]) -> Optional[str]:
@@ -1375,7 +1449,11 @@ class HardlinkVerify(_PluginBase):
                                     "variant": "tonal",
                                     "text": ("注意：只有挂载进 MoviePilot 容器的卷才能做 inode 比对。"
                                              "未挂载卷下的记录会被标记为「未挂载」跳过，"
-                                             "不会误报为丢失。"),
+                                             "不会误报为丢失。判定依据是容器真实的挂载表"
+                                             "（/proc/mounts），不依赖特定 NAS 的目录布局 —— "
+                                             "群晖 /volume1、绿联 /volume3/HDD_03、"
+                                             "常见 Docker 的 /data、/mnt/media 都能正确识别。"
+                                             "本插件**不需要你填写任何路径**。"),
                                 },
                             }),
                         ],
