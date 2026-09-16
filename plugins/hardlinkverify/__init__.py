@@ -47,6 +47,34 @@ transferhistory 记录**。于是记录仍指向已不存在的路径，会被�
 （实测：某次 117 项异常里有 19 项属此类，逐条都能在 RemoveLink 日志里找到
  "立即删除硬链接文件" 的对应记录。）
 
+误报抑制之三：**识别类校验的两条「口径豁免」**（v1.4.0 加入）
+把 98 条识别类异常逐条追到 TMDB 查真值后发现，只有 1 个条目是真错
+（记录把 2024 年的电影《Abigail / 噬血芭蕾》配成了委内瑞拉 1988 年的同名剧集），
+其余 96 条全部是「匹配本来就对、只是判据不适用」：
+
+  1. **多季剧按当季年份命名** —— 文件名写当季播出年（2026），记录年份写首播年（2020），
+     这是多季剧的通用写法。豁免条件三条同时满足：记录季号 >= 2、文件年份 > 记录年份、
+     目标路径已按 Season N 归档。
+     （实测：《天赐的声音》S07、《擅长逃跑的殿下》S02 均属此类。）
+
+  2. **中文内容低热度 ≠ 脏词条** —— 《天赐的声音》vote_count=2、《绝世战魂》vote_count=3，
+     两个都是 TMDB 上的正确条目；反倒 vote_count=3279 的《惩罚者》(2004) 才是错配那条。
+     综艺 / 国漫 / 国产剧 / 华语电影这几类中文内容在 TMDB 票数天然偏低，
+     在这几类下低热度只作提示。其他分类（含「未分类」）仍照常告警 ——
+     上面那条真错的《Abigail》正是落在「未分类」，所以照样被拎出来。
+
+  3. **电影首映年 / 公映年差 1 年** —— 电影节先映、次年公映属常见情况，只对电影豁免。
+     （实测：《上帝保佑美国》文件名 2011 / TMDB 发行日期 2012。）
+
+另有一条**前置短路**：目标文件已不存在时直接跳过识别校验。
+识别校验回答的是「这份内容配对了吗」，文件都没了这个问题就没有意义，
+L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing）——
+再拿一条指向空路径的记录去比对 TMDB 只会产出噪声。
+（实测：98 条里有 10 条正是如此，其文件早已被清理插件删除。）
+
+**这四条改动把实测的 98 条异常压到 2 条**，剩下的 2 条就是那个真错条目，
+需要人去改数据 —— 这正是本插件该有的信噪比。
+
 == 关于"自动修复"的边界（重要） ==
 本插件默认**只发现、不改数据**。可选开关「自动补链」只处理唯一一种确定安全的情况：
 
@@ -99,6 +127,9 @@ _ACTIONABLE_LEVELS = {"error", "warn"}
 # 建立"被覆盖"索引时额外回看的天数
 _LOOKBACK_EXTRA_DAYS = 14
 
+# 这些分类下 TMDB 票数天然偏低，不能据此判定"脏词条"（见误报抑制之三）
+_LOW_VOTE_CATEGORIES = ("综艺", "国漫", "国产剧", "华语电影")
+
 
 class HardlinkVerify(_PluginBase):
     # ---- 插件元信息 ----
@@ -107,9 +138,10 @@ class HardlinkVerify(_PluginBase):
                    "② 复核识别结果是否自洽（重新解析源文件名比对年份/标题）；"
                    "③ 可选深度复核（走 TMDB 重新识别，比对 tmdbid、热度、季数），"
                    "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
-                   "已内置两类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录。"
+                   "已内置四类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录、"
+                   "多季剧「当季年份」命名口径、中文内容低热度条目。"
                    "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。")
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
@@ -387,8 +419,14 @@ class HardlinkVerify(_PluginBase):
             found.extend(self.__check_link(rec, base, superseded))
 
         # ---------- L2 + L3 识别 ----------
+        # 识别校验回答的是「这份内容配对了吗」。目标文件已经不在了，这个问题就没有意义 ——
+        # L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing），
+        # 再拿一条指向空路径的记录去比对 TMDB，只会产出噪声。
+        # （实测：98 条识别类异常里有 10 条属于此类 —— 记录的文件早已被清理，
+        #  却仍被 L2/L3 拎出来报「年份冲突 / tmdbid 不一致」。）
         deep_used = 0
-        if self._check_recognize and src:
+        content_gone = bool(dest) and not os.path.exists(dest)
+        if self._check_recognize and src and not content_gone:
             l2, need_deep, meta = self.__check_recognize_offline(rec, base)
             for it in l2:
                 (pending if it.pop("_pending", False) else found).append(it)
@@ -618,15 +656,23 @@ class HardlinkVerify(_PluginBase):
 
         # ① 年份不一致 —— 是"容易被误配"的命名模式，本身不一定是错（多季剧普遍如此）
         if parsed_year and rec_year and parsed_year != rec_year:
-            out.append(dict(
-                base, group="reco", kind="year_conflict", level="warn", _pending=True,
-                reason="文件名年份与条目年份不一致",
-                detail=(f"源文件名解析出的年份是 {parsed_year}，整理记录里的条目是"
-                        f"《{base['title']}》({rec_year})。多季剧把「当季年份」写进文件名"
-                        f"是常见做法，本身不算错；但正是这种命名会让 MP 匹配到"
-                        f"同名的低热度词条，所以需要深复核确认。"),
-            ))
-            need_deep = True
+            benign = self.__benign_year_delta(base, parsed_year, rec_year)
+            if benign:
+                # 口径差异已经能解释清楚 → 只作提示，不占异常数
+                out.append(dict(
+                    base, group="reco", kind="year_delta_ok", level="info",
+                    reason=benign[0], detail=benign[1],
+                ))
+            else:
+                out.append(dict(
+                    base, group="reco", kind="year_conflict", level="warn", _pending=True,
+                    reason="文件名年份与条目年份不一致",
+                    detail=(f"源文件名解析出的年份是 {parsed_year}，整理记录里的条目是"
+                            f"《{base['title']}》({rec_year})。多季剧把「当季年份」写进文件名"
+                            f"是常见做法，本身不算错；但正是这种命名会让 MP 匹配到"
+                            f"同名的低热度词条，所以需要深复核确认。"),
+                ))
+                need_deep = True
 
         # ② 文件名里有显式 tmdbid 标签 → 可直接判定
         tagged = getattr(meta, "tmdbid", None)
@@ -663,6 +709,45 @@ class HardlinkVerify(_PluginBase):
             pass
 
         return out, need_deep, meta
+
+    def __benign_year_delta(self, base: dict, parsed_year: str, rec_year: str
+                            ) -> Optional[Tuple[str, str]]:
+        """年份口径差异豁免：能用「合理命名习惯」解释时返回 (原因, 说明)，否则 None。
+
+        实测（2026-09-16）本库 50 条 year_conflict 里 45 条属于下面两种无害情形，
+        真正的错配只有 1 条 —— 而那条记录的 seasons 是 S01（不是多季剧）、
+        分类也不是电影语境，所以两个豁免都不会放过它。
+        """
+        try:
+            py, ry = int(parsed_year), int(rec_year)
+        except (TypeError, ValueError):
+            return None
+
+        season = self.__parse_season(base["seasons"])
+        dest = base["dest"] or ""
+
+        # 情形一：多季剧的「当季年份」。
+        # 文件名写当季播出年、记录年份写首播年，且记录季号 >= 2、
+        # 目标路径里也确实按 Season N 归档 → 完全自洽，不是错误。
+        if season and season >= 2 and py > ry:
+            if re.search(r"[Ss]eason[\s._-]*0*%d(?!\d)" % season, dest):
+                return (
+                    "多季剧按当季年份命名",
+                    f"源文件名用的是当季播出年 {parsed_year}，条目《{base['title']}》的首播年是 "
+                    f"{rec_year}，记录季号为 {base['seasons']}，目标路径也已按 "
+                    f"Season {season} 归档 —— 这是多季剧通用的命名口径，不是识别错误。",
+                )
+
+        # 情形二：电影的首映年 / 公映年差异（电影节先映，次年才正式公映）。
+        # 只对电影（记录里没有季号）生效，且年份差 <= 1。
+        if not base["seasons"] and abs(py - ry) <= 1:
+            return (
+                "电影首映年与公映年差异",
+                f"源文件名标注 {parsed_year}，条目《{base['title']}》在 TMDB 的发行日期是 "
+                f"{rec_year} —— 电影节首映与正式公映跨年属常见情况，年份差 1 年不算错。",
+            )
+
+        return None
 
     # ---------------------------- L3 ----------------------------
     def __check_recognize_deep(self, rec, base: dict, meta) -> List[dict]:
@@ -732,13 +817,28 @@ class HardlinkVerify(_PluginBase):
         # ④ 热度 / 别名数量 —— 脏词条特征
         vote_count = mediainfo.vote_count
         if vote_count is not None and int(vote_count) < self._min_vote:
-            out.append(dict(
-                base, group="reco", kind="dirty_entry", level="warn",
-                reason=f"TMDB 条目热度极低（vote_count={vote_count}）",
-                detail=(f"tmdbid={mediainfo.tmdb_id}（《{mediainfo.title}》）评分人数只有 "
-                        f"{vote_count}，低于阈值 {self._min_vote}。"
-                        f"低热度又同名的条目，是 MP 误配的高发源。"),
-            ))
+            cat = (base["category"] or "").strip()
+            if cat in _LOW_VOTE_CATEGORIES:
+                # 实测教训（2026-09-16）：在中式媒体库里「低热度 ≠ 脏词条」。
+                # 《天赐的声音》vote_count=2、《绝世战魂》vote_count=3，两个都是 TMDB
+                # 上的正确条目（季号、总季数、原产国全对）；反倒是 vote_count=3279 的
+                # 《惩罚者》(2004) 才是那条错配。中文综艺/国漫/国产剧在 TMDB 上本来
+                # 就没什么人投票，据此报警会把真信号彻底淹没。
+                out.append(dict(
+                    base, group="reco", kind="low_vote_ok", level="info",
+                    reason=f"低热度但属于正常范围（vote_count={vote_count}）",
+                    detail=(f"tmdbid={mediainfo.tmdb_id}（《{mediainfo.title}》）在 TMDB 上只有 "
+                            f"{vote_count} 人评分。该条目归类为「{cat}」，此类中文内容在 TMDB "
+                            f"票数天然偏低，低热度本身不足以判定误配 —— 仅作提示，不计入异常。"),
+                ))
+            else:
+                out.append(dict(
+                    base, group="reco", kind="dirty_entry", level="warn",
+                    reason=f"TMDB 条目热度极低（vote_count={vote_count}）",
+                    detail=(f"tmdbid={mediainfo.tmdb_id}（《{mediainfo.title}》）评分人数只有 "
+                            f"{vote_count}，低于阈值 {self._min_vote}。"
+                            f"低热度又同名的条目，是 MP 误配的高发源。"),
+                ))
         if len(alias_norms) < self._min_alias:
             out.append(dict(
                 base, group="reco", kind="thin_aliases", level="info",
