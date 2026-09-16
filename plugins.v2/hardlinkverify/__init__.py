@@ -90,9 +90,28 @@ L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing
 **明确不做的事**：不去"修复"「目标文件不存在」的记录。因为这类记录的源文件
 通常也已随清理一起消失 —— 无物可链，唯一出路是重新下载；而重新下载会再次触发
 清理插件（它监听到新增即纳管、源被删即连带清库），形成"下了又删"的死循环。
+
+== 关于"僵尸记录清理"（可选，默认关闭） ==
+
+清理插件（RemoveLink 等）在源文件被删后会连带删掉媒体库硬链接、刮削文件与空目录，
+但它**不删 transferhistory 记录** —— 于是这类记录越攒越多，一直指向早已不存在的路径。
+可选开关「自动清理僵尸整理记录」把这些残留从数据库里删掉。
+
+判定"僵尸"的硬条件（源与目标都已不存在）：
+  - srcs 非空、dest 非空；
+  - dest 不存在，且 srcs 里**每一个**都不存在；
+  - dest 与每个 src 所在卷都已挂载进 MP 容器（未挂载一律判为"看不见"，
+    **绝不**当作"不存在" —— 容器的 os.path.exists 对没挂载的卷一律返回 False）。
+被更新记录接管的旧记录（superseded）保留不删，留作追溯。
+
+安全性：`TransferHistoryOper().delete(id)` 最终落到
+`Base.delete()` = `db.query(cls).filter(id == rid).delete()`，
+**纯数据库行删除，不触碰磁盘**。做种源文件、媒体库母本、刮削产物全部不受影响。
+每条被删记录都会把整行快照写进插件数据 `prune_log`（保留最近 10 轮），可翻查/可恢复。
 """
 
 import datetime
+import json
 import os
 import re
 from pathlib import Path
@@ -140,8 +159,10 @@ class HardlinkVerify(_PluginBase):
                    "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
                    "已内置四类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录、"
                    "多季剧「当季年份」命名口径、中文内容低热度条目。"
-                   "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。")
-    plugin_version = "1.4.0"
+                   "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。"
+                   "可选「自动清理僵尸整理记录」：源与目标都已不存在的残留记录（清理插件不会删它们）"
+                   "从数据库里清掉，只删记录不删文件，默认关闭。")
+    plugin_version = "1.5.0"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
@@ -165,6 +186,10 @@ class HardlinkVerify(_PluginBase):
     _auto_relink: bool = False
     _relink_max: int = 50
     _relink_used: int = 0
+    _auto_prune: bool = False
+    _prune_max: int = 50
+    _prune_used: int = 0
+    _prune_stamp: str = ""
     _scheduler: Optional[BackgroundScheduler] = None
 
     # ==================================================================
@@ -187,6 +212,8 @@ class HardlinkVerify(_PluginBase):
         self._max_records = self.__to_int(config.get("max_records"), 3000)
         self._auto_relink = bool(config.get("auto_relink", False))
         self._relink_max = self.__to_int(config.get("relink_max"), 50)
+        self._auto_prune = bool(config.get("auto_prune", False))
+        self._prune_max = self.__to_int(config.get("prune_max"), 50)
 
         if self._onlyonce:
             logger.info("【硬链接与识别校验】立即运行一次")
@@ -307,9 +334,11 @@ class HardlinkVerify(_PluginBase):
         notes: List[dict] = []
         deep_budget = self._max_deep
         self._relink_used = 0
+        self._prune_used = 0
+        self._prune_stamp = started.strftime("%Y-%m-%d %H:%M:%S")
         stat = {"checked": 0, "link_bad": 0, "reco_bad": 0,
                 "skipped_unmounted": 0, "superseded": 0, "deep_done": 0,
-                "cleaned": 0, "relinked": 0}
+                "cleaned": 0, "relinked": 0, "pruned": 0}
 
         ctx = {"dest_latest": dest_latest, "key_latest": key_latest, "stat": stat}
 
@@ -332,6 +361,11 @@ class HardlinkVerify(_PluginBase):
                 if it.get("kind") == "cleaned":
                     # 源与目标整块已被清理插件删除 → 预期行为，只作提示
                     stat["cleaned"] += 1
+                    notes.append(it)
+                    continue
+                if it.get("kind") == "pruned":
+                    # 本轮刚把僵尸整理记录从数据库里清掉 → 已处理完，只作提示
+                    stat["pruned"] += 1
                     notes.append(it)
                     continue
                 if it.get("kind") == "relinked":
@@ -364,6 +398,7 @@ class HardlinkVerify(_PluginBase):
             "deep_done": stat["deep_done"],
             "cleaned": stat["cleaned"],
             "relinked": stat["relinked"],
+            "pruned": stat["pruned"],
             "items": issues[:400],
             "note_items": notes[:200],
         }
@@ -375,7 +410,8 @@ class HardlinkVerify(_PluginBase):
         logger.info(
             f"【硬链接与识别校验】巡检完成：判定 {result['checked']} 条，"
             f"异常 {result['issues']} 条（断链 {result['link_bad']} / 识别 {result['reco_bad']}），"
-            f"提示 {result['notes']} 条（其中已清理 {result['cleaned']} / 已补链 {result['relinked']}），"
+            f"提示 {result['notes']} 条（其中已清理 {result['cleaned']} / 已补链 {result['relinked']} "
+            f"/ 已删僵尸记录 {result['pruned']}），"
             f"被覆盖跳过 {result['superseded']} 条，"
             f"深度复核 {result['deep_done']} 条，未挂载跳过 {result['unmounted']} 条"
         )
@@ -484,7 +520,13 @@ class HardlinkVerify(_PluginBase):
             if superseded:
                 # 旧记录的目标已被新记录接管 → 预期行为，不计异常
                 emit("superseded", "info", superseded, superseded)
-            elif self.__looks_cleaned(srcs, dest):
+                return out
+            # 记录已成"僵尸"（源与目标都不存在了）→ 可选清理，详见 __try_prune
+            pruned = self.__try_prune(rec, base, srcs, dest)
+            if pruned:
+                out.append(pruned)
+                return out
+            if self.__looks_cleaned(srcs, dest):
                 # 源与目标整块消失 → 清理插件（RemoveLink 等）删种同时删库的预期结果
                 emit("cleaned", "info", "整块资源已被清理",
                      "下载文件与媒体库目录均已不存在，符合清理插件"
@@ -571,6 +613,122 @@ class HardlinkVerify(_PluginBase):
         if parent and os.path.exists(parent):
             return False
         return not any(os.path.exists(s) for s in srcs)
+
+    # ---------------------- 僵尸记录清理（可选） ----------------------
+    @classmethod
+    def __is_prunable(cls, srcs: List[str], dest: str) -> bool:
+        """
+        判定一条整理记录是否已成"僵尸记录"：**源文件与目标文件都不存在了**。
+
+        与 __looks_cleaned 的区别：后者额外要求"目标所在目录也不存在"
+        （严格意义上的"整块被清理"）；本方法只要目标文件本身没了、且源文件
+        全部没了就算。差异场景：剧集目录里其他集还在，只有这一集被清理插件
+        删掉 —— 落进 dest_missing 被当成"媒体库文件丢失"误报，其实同属僵尸。
+
+        安全前提（缺一不可，否则一律判为"不可清理"）：
+          1. 有源文件信息、有目标路径；
+          2. 目标所在卷**已挂载进 MoviePilot 容器**；
+          3. 每个源文件所在卷也都已挂载。
+        第 2、3 条是硬护栏：容器的 os.path.exists 对"没挂载的卷"一律返回 False，
+        若不先确认挂载状态，就会把"看不见"当成"不存在"，误删活记录。
+        """
+        if not srcs or not dest:
+            return False
+        if not cls.__is_mounted(dest):
+            return False
+        for s in srcs:
+            if not cls.__is_mounted(s):
+                return False
+            if os.path.exists(s):
+                return False
+        return True
+
+    def __try_prune(self, rec, base: dict, srcs: List[str], dest: str) -> Optional[dict]:
+        """
+        删除「源与目标都已不存在」的僵尸整理记录（可选功能，默认关闭）。
+
+        为什么这么做是安全的：这条记录指向的下载文件与媒体库文件都已经不存在了，
+        清理掉的只是一行数据库文本 —— 磁盘上没有任何东西随之消失，做种源文件、
+        媒体库母本、刮削产物全部不受影响。这类记录是清理插件（RemoveLink 等）
+        删种删库时**不会**顺手删掉的残留，积累下去会让整理记录页越来越脏。
+
+        护栏（全部满足才动手）：
+          1. 开关 self._auto_prune 开启，且未超出本轮 self._prune_max 上限；
+          2. 非「被更新记录接管」（superseded 的旧记录保留，留作追溯）；
+          3. __is_prunable：源与目标确实都不存在，且相关卷均已挂载进容器；
+          4. 删除前把整行记录快照写进插件数据 prune_log（保留最近 10 轮），
+             随时可翻查、可人工恢复。
+        """
+        if not self._auto_prune or self._prune_used >= max(self._prune_max, 0):
+            return None
+        rid = base.get("id")
+        if not rid or not self.__is_prunable(srcs, dest):
+            return None
+
+        snapshot, detail = self.__snapshot_record(rec, base, srcs, dest)
+        try:
+            TransferHistoryOper().delete(int(rid))
+        except Exception as e:
+            logger.error(f"【硬链接与识别校验】清理僵尸记录 #{rid} 失败：{e}")
+            return None
+
+        self._prune_used += 1
+        self.__record_prune(detail)
+        logger.info(
+            f"【硬链接与识别校验】已清理僵尸整理记录 #{rid}"
+            f"《{base.get('title')}》→ {dest}"
+        )
+        return dict(base, group="link", kind="pruned", level="info",
+                    reason="僵尸整理记录已清理",
+                    detail=("该记录指向的下载文件与媒体库文件都已不存在，"
+                            "记录本身已无用途，已从整理记录中移除（**只删记录，"
+                            "磁盘上没有任何文件被删除**）。"
+                            "已留快照可查：插件数据 prune_log。"
+                            f"目标：{dest}"))
+
+    def __record_prune(self, snapshot: dict):
+        """把清理快照按轮次追加进插件数据 prune_log（保留最近 10 轮）。"""
+        try:
+            log = self.get_data("prune_log") or []
+            if not isinstance(log, list):
+                log = []
+            stamp = self._prune_stamp or datetime.datetime.now(
+                tz=pytz.timezone(settings.TZ)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            if log and isinstance(log[0], dict) and log[0].get("time") == stamp:
+                log[0].setdefault("items", []).append(snapshot)
+            else:
+                log.insert(0, {"time": stamp, "items": [snapshot]})
+            self.save_data("prune_log", log[:10])
+        except Exception as e:
+            # 快照写失败不阻断清理本身，但要在日志里留痕
+            logger.warning(f"【硬链接与识别校验】写入清理快照失败：{e}")
+
+    @staticmethod
+    def __snapshot_record(rec, base: dict, srcs: List[str], dest: str) -> Tuple[str, dict]:
+        """生成被清理记录的完整快照，用于事后追溯/恢复。"""
+        row = {}
+        try:
+            for col in rec.__table__.columns:
+                row[col.name] = getattr(rec, col.name, None)
+        except Exception:
+            row = {"id": base.get("id"), "title": base.get("title")}
+        row["files"] = srcs
+        text = json.dumps(row, ensure_ascii=False, default=str)
+        entry = {
+            "id": base.get("id"),
+            "date": base.get("date"),
+            "title": base.get("title"),
+            "year": base.get("year"),
+            "tmdbid": base.get("tmdbid"),
+            "category": base.get("category"),
+            "seasons": base.get("seasons"),
+            "mode": base.get("mode"),
+            "dest": dest,
+            "src": base.get("src"),
+            "row": text[:20000],
+        }
+        return text, entry
 
     def __try_relink(self, srcs: List[str], base: dict, dest: str) -> Optional[dict]:
         """
@@ -973,11 +1131,14 @@ class HardlinkVerify(_PluginBase):
         notes = result.get("notes", 0)
         cleaned = result.get("cleaned", 0)
         relinked = result.get("relinked", 0)
+        pruned = result.get("pruned", 0)
         extra = []
         if cleaned:
             extra.append(f"已清理无效 {cleaned} 条")
         if relinked:
             extra.append(f"已自动补链 {relinked} 条")
+        if pruned:
+            extra.append(f"已删除僵尸整理记录 {pruned} 条")
         extra_txt = ("；" + "、".join(extra)) if extra else ""
         if total == 0:
             if checked:
@@ -1038,6 +1199,13 @@ class HardlinkVerify(_PluginBase):
                         "content": [
                             self.__col(3, self.__switch("auto_relink", "自动补链(独立副本→硬链接)")),
                             self.__col(2, self.__text("relink_max", "每轮补链上限", "50")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(3, self.__switch("auto_prune", "自动清理僵尸整理记录")),
+                            self.__col(2, self.__text("prune_max", "每轮清理上限", "50")),
                         ],
                     },
                     {
@@ -1134,6 +1302,30 @@ class HardlinkVerify(_PluginBase):
                             }),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "error",
+                                    "variant": "tonal",
+                                    "text": ("「自动清理僵尸整理记录」默认**关闭**。开启后只会清理一种记录："
+                                             "**它指向的下载文件与媒体库文件都已不存在**"
+                                             "（清理插件删种删库时不会顺手删掉这类残留，"
+                                             "攒久了整理记录页会越来越脏）。"
+                                             "护栏：① 源文件与目标路径所在卷都必须已挂载进容器"
+                                             "（未挂载一律判为「看不见」，绝不当作「不存在」）；"
+                                             "② 被更新记录接管（旧版本/旧路径）的记录保留不删；"
+                                             "③ 受「每轮清理上限」约束，不会一次性删库；"
+                                             "④ 每删一条都会把整行快照写进插件数据 `prune_log`"
+                                             "（保留最近 10 轮），可翻查、可人工恢复。"
+                                             "**它只删数据库记录一行，不会删除磁盘上的任何文件** —— "
+                                             "做种源文件、媒体库母本、刮削产物全部不受影响。"),
+                                },
+                            }),
+                        ],
+                    },
                 ],
             }
         ], {
@@ -1150,6 +1342,8 @@ class HardlinkVerify(_PluginBase):
             "min_vote": 10,
             "auto_relink": False,
             "relink_max": 50,
+            "auto_prune": False,
+            "prune_max": 50,
         }
 
     @staticmethod
@@ -1185,6 +1379,8 @@ class HardlinkVerify(_PluginBase):
             "min_vote": self._min_vote,
             "auto_relink": self._auto_relink,
             "relink_max": self._relink_max,
+            "auto_prune": self._auto_prune,
+            "prune_max": self._prune_max,
         })
 
     # ==================================================================
@@ -1261,6 +1457,7 @@ class HardlinkVerify(_PluginBase):
             self.__stat("提示(非异常)", f"{last.get('notes', 0)} 条", "grey"),
             self.__stat("已清理(无效)", f"{last.get('cleaned', 0)} 条", "grey"),
             self.__stat("已补链(释放空间)", f"{last.get('relinked', 0)} 条", "green"),
+            self.__stat("已删僵尸记录", f"{last.get('pruned', 0)} 条", "green"),
             self.__stat("已忽略(被覆盖)", f"{last.get('superseded', 0)} 条", "grey"),
         ]
 
@@ -1274,6 +1471,7 @@ class HardlinkVerify(_PluginBase):
                 "reco_bad": h.get("reco_bad", 0),
                 "notes": h.get("notes", 0),
                 "superseded": h.get("superseded", 0),
+                "pruned": h.get("pruned", 0),
             }
             for h in history
         ]
@@ -1414,6 +1612,7 @@ class HardlinkVerify(_PluginBase):
                                         {"title": "断链", "key": "link_bad", "sortable": True},
                                         {"title": "识别", "key": "reco_bad", "sortable": True},
                                         {"title": "提示", "key": "notes", "sortable": True},
+                                        {"title": "已删记录", "key": "pruned", "sortable": True},
                                         {"title": "已忽略", "key": "superseded", "sortable": True},
                                     ],
                                     "items": hist_items,
