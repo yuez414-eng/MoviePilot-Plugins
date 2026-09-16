@@ -37,6 +37,31 @@ hardlink 到**同一个 dest**，后一次会让前一次记录的 inode 关系�
   - 遍历窗口外的记录建立"同路径 / 同剧同季 最新记录"索引
   - 只对**每个 dest 的最新那条记录**做判定，被覆盖的旧记录仅计数不计为异常
 这样才能把信噪比压到可用水平（实测从 1311/2000 项噪音降到个位数真问题）。
+
+误报抑制之二：**清理插件留下的孤儿记录**
+「清理媒体文件 / RemoveLink」这类插件在下载文件被删除后，会按 inode 连带删除
+媒体库中的硬链接、刮削文件（nfo/jpg/png）并清理空目录，但它**不删除
+transferhistory 记录**。于是记录仍指向已不存在的路径，会被朴素实现误报成
+"媒体库文件丢失"。本插件检测到「目标所在目录不存在 **且** 所有源文件都不存在」
+时判定为「已清理」，归入提示而不计入异常。
+（实测：某次 117 项异常里有 19 项属此类，逐条都能在 RemoveLink 日志里找到
+ "立即删除硬链接文件" 的对应记录。）
+
+== 关于"自动修复"的边界（重要） ==
+本插件默认**只发现、不改数据**。可选开关「自动补链」只处理唯一一种确定安全的情况：
+
+  媒体库文件是**独立副本** —— 与源文件内容完全一致、只是 inode 不同，
+  白占一份空间（同一集被 link 成两份实体）。
+
+此时按 inode 重建硬链接即可省下一份空间。护栏（全部满足才动手）：
+  - 该副本 st_nlink == 1（是"孤本"，不存在别的路径指向它 =
+    不会被清理插件按 inode 连带删除其它文件）
+  - 源文件存在、同文件系统、**字节数完全一致**（避免把 2160p 降级成 1080p 的链接）
+  - 先 os.link 建临时名并校验 inode，再 os.replace 原子替换；失败回滚
+
+**明确不做的事**：不去"修复"「目标文件不存在」的记录。因为这类记录的源文件
+通常也已随清理一起消失 —— 无物可链，唯一出路是重新下载；而重新下载会再次触发
+清理插件（它监听到新增即纳管、源被删即连带清库），形成"下了又删"的死循环。
 """
 
 import datetime
@@ -82,8 +107,9 @@ class HardlinkVerify(_PluginBase):
                    "② 复核识别结果是否自洽（重新解析源文件名比对年份/标题）；"
                    "③ 可选深度复核（走 TMDB 重新识别，比对 tmdbid、热度、季数），"
                    "把「美剧被刮成日韩剧」这类误配在进库后捞出来并告警。"
-                   "已内置同路径覆盖抑制，避免重复整理产生噪音。")
-    plugin_version = "1.2.2"
+                   "已内置两类误报抑制：同路径覆盖、清理插件（RemoveLink 等）留下的孤儿记录。"
+                   "可选「自动补链」：把媒体库里的独立副本按 inode 换回硬链接以释放空间，默认关闭。")
+    plugin_version = "1.3.0"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
@@ -104,6 +130,9 @@ class HardlinkVerify(_PluginBase):
     _min_vote: int = 10
     _min_alias: int = 3
     _max_records: int = 3000
+    _auto_relink: bool = False
+    _relink_max: int = 50
+    _relink_used: int = 0
     _scheduler: Optional[BackgroundScheduler] = None
 
     # ==================================================================
@@ -124,6 +153,8 @@ class HardlinkVerify(_PluginBase):
         self._min_vote = self.__to_int(config.get("min_vote"), 10)
         self._min_alias = self.__to_int(config.get("min_alias"), 3)
         self._max_records = self.__to_int(config.get("max_records"), 3000)
+        self._auto_relink = bool(config.get("auto_relink", False))
+        self._relink_max = self.__to_int(config.get("relink_max"), 50)
 
         if self._onlyonce:
             logger.info("【硬链接与识别校验】立即运行一次")
@@ -243,8 +274,10 @@ class HardlinkVerify(_PluginBase):
         issues: List[dict] = []
         notes: List[dict] = []
         deep_budget = self._max_deep
+        self._relink_used = 0
         stat = {"checked": 0, "link_bad": 0, "reco_bad": 0,
-                "skipped_unmounted": 0, "superseded": 0, "deep_done": 0}
+                "skipped_unmounted": 0, "superseded": 0, "deep_done": 0,
+                "cleaned": 0, "relinked": 0}
 
         ctx = {"dest_latest": dest_latest, "key_latest": key_latest, "stat": stat}
 
@@ -263,6 +296,16 @@ class HardlinkVerify(_PluginBase):
                     continue
                 if it.get("kind") == "superseded":
                     stat["superseded"] += 1
+                    continue
+                if it.get("kind") == "cleaned":
+                    # 源与目标整块已被清理插件删除 → 预期行为，只作提示
+                    stat["cleaned"] += 1
+                    notes.append(it)
+                    continue
+                if it.get("kind") == "relinked":
+                    # 本轮刚把独立副本换回硬链接 → 已处理完，只作提示
+                    stat["relinked"] += 1
+                    notes.append(it)
                     continue
                 if it["level"] not in _ACTIONABLE_LEVELS:
                     notes.append(it)
@@ -287,6 +330,8 @@ class HardlinkVerify(_PluginBase):
             "unmounted": stat["skipped_unmounted"],
             "superseded": stat["superseded"],
             "deep_done": stat["deep_done"],
+            "cleaned": stat["cleaned"],
+            "relinked": stat["relinked"],
             "items": issues[:400],
             "note_items": notes[:200],
         }
@@ -298,7 +343,8 @@ class HardlinkVerify(_PluginBase):
         logger.info(
             f"【硬链接与识别校验】巡检完成：判定 {result['checked']} 条，"
             f"异常 {result['issues']} 条（断链 {result['link_bad']} / 识别 {result['reco_bad']}），"
-            f"提示 {result['notes']} 条，被覆盖跳过 {result['superseded']} 条，"
+            f"提示 {result['notes']} 条（其中已清理 {result['cleaned']} / 已补链 {result['relinked']}），"
+            f"被覆盖跳过 {result['superseded']} 条，"
             f"深度复核 {result['deep_done']} 条，未挂载跳过 {result['unmounted']} 条"
         )
         self.__notify_result(result)
@@ -400,6 +446,13 @@ class HardlinkVerify(_PluginBase):
             if superseded:
                 # 旧记录的目标已被新记录接管 → 预期行为，不计异常
                 emit("superseded", "info", superseded, superseded)
+            elif self.__looks_cleaned(srcs, dest):
+                # 源与目标整块消失 → 清理插件（RemoveLink 等）删种同时删库的预期结果
+                emit("cleaned", "info", "整块资源已被清理",
+                     "下载文件与媒体库目录均已不存在，符合清理插件"
+                     "（如「清理媒体文件 / RemoveLink」在源文件被删后连带清理硬链接、"
+                     "刮削文件并删除空目录）的预期行为；该类清理不删除整理记录，"
+                     "因此记录仍会指向已不存在的路径。不计为异常。")
             else:
                 emit("dest_missing", "error", "媒体库文件不存在",
                      f"整理记录指向的目标文件已不存在，且没有更新的整理记录接管该路径。"
@@ -443,16 +496,110 @@ class HardlinkVerify(_PluginBase):
                 emit("superseded", "info", superseded,
                      f"{len(broken)} 个源文件与目标不再同 inode —— {superseded}")
             else:
-                emit("link_broken", "error", "硬链接已断开",
-                     f"{len(broken)} 个源文件在媒体库中没有对应的硬链接"
-                     f"（媒体库成了独立副本：源种子删掉后仍占空间，且不再是保种文件）。"
-                     f"示例：{os.path.basename(broken[0])}")
+                fixed = self.__try_relink(broken, base, dest)
+                if fixed:
+                    out.append(fixed)
+                else:
+                    emit("link_broken", "error", "硬链接已断开",
+                         f"{len(broken)} 个源文件在媒体库中没有对应的硬链接"
+                         f"（媒体库成了独立副本：源种子删掉后仍占空间，且不再是保种文件）。"
+                         f"示例：{os.path.basename(broken[0])}")
         if lost_src:
             emit("src_missing", "info", "源文件已不在下载目录",
                  f"{len(lost_src)} 个源文件已不存在（做种结束正常清理可忽略；"
                  f"媒体库硬链接本身仍指向文件本体，不会丢）。"
                  f"示例：{os.path.basename(lost_src[0])}")
         return out
+
+    # ---------------------- 已清理 / 自动补链 ----------------------
+    @staticmethod
+    def __looks_cleaned(srcs: List[str], dest: str) -> bool:
+        """
+        判定「整块资源已被清理」。
+
+        典型场景：清理插件（「清理媒体文件 / RemoveLink」）监控到下载文件被删除后，
+        会按 inode 连带删除媒体库中的硬链接、刮削文件（nfo/jpg/png）并清理空目录，
+        但它不删除 transferhistory 记录 —— 于是记录仍指向已不存在的路径。
+        这类记录不是故障，不应计入异常。
+
+        判据（三者同时满足才算"已清理"）：
+          1. 目标所在目录也不存在（整块消失，而非单个文件丢失）；
+          2. 有源文件信息（信息不足时保守判为异常 —— 宁可多报，不可漏报）；
+          3. 所有源文件都不存在（源也没了 → 是整体清理，不是媒体库被误删）。
+        """
+        if not srcs:
+            return False
+        parent = os.path.dirname(dest)
+        if parent and os.path.exists(parent):
+            return False
+        return not any(os.path.exists(s) for s in srcs)
+
+    def __try_relink(self, srcs: List[str], base: dict, dest: str) -> Optional[dict]:
+        """
+        把「媒体库独立副本」换回硬链接（可选功能，默认关闭）。
+
+        安全护栏 —— 全部满足才动手，任一不满足即放弃并保持原判定：
+          1. 开关 self._auto_relink 打开，且未超出本轮 self._relink_max 上限；
+          2. dest 是文件，且 **st_nlink == 1**。这条最关键：被替换掉的那份必须是
+             "孤本"，不存在其他硬链接指向它。因为清理插件是按 inode 工作的
+             （删除时会找出同 inode 的所有路径一并删除），若 dest 还被别的文件
+             引用着，替换会连带把那个文件（很可能是正在做种的源）删掉；
+          3. 存在一个源文件：同文件系统 + **字节数完全相同**。内容一致才换，
+             避免把 2160p 的库文件降级成 1080p 的链接；
+          4. 先 os.link 到临时名并校验 inode，再 os.replace 原子替换；
+             任何一步失败都干净退出，绝不动原文件。
+        """
+        if not self._auto_relink or self._relink_used >= max(self._relink_max, 0):
+            return None
+        try:
+            if not os.path.isfile(dest):
+                return None
+            dst = os.stat(dest)
+        except OSError:
+            return None
+        if dst.st_nlink != 1:
+            return None
+
+        for s in srcs:
+            tmp = ""
+            try:
+                if not os.path.isfile(s):
+                    continue
+                sst = os.stat(s)
+                if sst.st_dev != dst.st_dev:
+                    continue
+                if os.path.getsize(s) != dst.st_size:
+                    continue
+                tmp = dest + ".hlvfix"
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                os.link(s, tmp)
+                tst = os.stat(tmp)
+                if (tst.st_dev, tst.st_ino) != (sst.st_dev, sst.st_ino):
+                    os.remove(tmp)
+                    continue
+                os.replace(tmp, dest)
+                nst = os.stat(dest)
+            except OSError as e:
+                logger.warning(f"【硬链接与识别校验】自动补链失败 {dest}：{e}")
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                return None
+
+            if (nst.st_dev, nst.st_ino) != (sst.st_dev, sst.st_ino):
+                return None
+
+            self._relink_used += 1
+            logger.info(f"【硬链接与识别校验】已自动补链：{dest} <- {s}")
+            return dict(base, group="link", kind="relinked", level="info",
+                        reason="独立副本已换回硬链接",
+                        detail=f"该路径原为独立副本（与源内容一致、仅 inode 不同，"
+                               f"白占一份空间）。已重建为硬链接，释放约 "
+                               f"{dst.st_size / 1048576:.0f} MB。源：{os.path.basename(s)}")
+        return None
 
     # ---------------------------- L2 ----------------------------
     def __check_recognize_offline(self, rec, base: dict) -> Tuple[List[dict], bool, Any]:
@@ -724,9 +871,17 @@ class HardlinkVerify(_PluginBase):
             return
         checked, total = result["checked"], result["issues"]
         notes = result.get("notes", 0)
+        cleaned = result.get("cleaned", 0)
+        relinked = result.get("relinked", 0)
+        extra = []
+        if cleaned:
+            extra.append(f"已清理无效 {cleaned} 条")
+        if relinked:
+            extra.append(f"已自动补链 {relinked} 条")
+        extra_txt = ("；" + "、".join(extra)) if extra else ""
         if total == 0:
             if checked:
-                tail = f"另有 {notes} 条提示（非异常，见插件详情页）。" if notes else ""
+                tail = f"另有 {notes} 条提示（非异常，见插件详情页{extra_txt}）。" if notes else ""
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【硬链接与识别校验】巡检通过 ✅",
@@ -741,7 +896,8 @@ class HardlinkVerify(_PluginBase):
                  f"断链 {result['link_bad']} / 识别 {result['reco_bad']}"
                  f"（其中严重 {len(errors)} 项）",
                  f"已自动忽略被覆盖旧记录 {result['superseded']} 条"
-                 + (f"；另有 {notes} 条非异常提示" if notes else ""), ""]
+                 + (f"；另有 {notes} 条非异常提示" if notes else "")
+                 + extra_txt, ""]
         for it in result["items"][:15]:
             lines.append(
                 f"- [{_LEVEL_TEXT.get(it['level'], it['level'])}] "
@@ -780,6 +936,13 @@ class HardlinkVerify(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
+                            self.__col(3, self.__switch("auto_relink", "自动补链(独立副本→硬链接)")),
+                            self.__col(2, self.__text("relink_max", "每轮补链上限", "50")),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
                             self.__col(4, self.__cron("cron", "定时执行周期", "0 5 * * *")),
                             self.__col(2, self.__text("days", "判定回溯天数", "3")),
                             self.__col(2, self.__text("max_records", "单次读取上限", "3000")),
@@ -811,10 +974,27 @@ class HardlinkVerify(_PluginBase):
                                 "props": {
                                     "type": "warning",
                                     "variant": "tonal",
-                                    "text": ("误报抑制：同一媒体库路径会被反复整理覆盖"
+                                    "text": ("误报抑制 ①：同一媒体库路径会被反复整理覆盖"
                                              "（同一集 1080p / 2160p 会 hardlink 到同一 dest），"
                                              "插件只判定每个 dest 的**最新**记录，"
                                              "被覆盖的旧记录自动忽略并单独计数。"),
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "warning",
+                                    "variant": "tonal",
+                                    "text": ("误报抑制 ②：清理插件（如「清理媒体文件 / RemoveLink」）在"
+                                             "下载文件被删除后会连带清掉媒体库硬链接与刮削文件、"
+                                             "并删除空目录，但它**不删整理记录**。"
+                                             "本插件检测到「源与目标整块都不存在」时判定为"
+                                             "「已清理」，只作提示、不计异常。"),
                                 },
                             }),
                         ],
@@ -834,6 +1014,26 @@ class HardlinkVerify(_PluginBase):
                             }),
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "error",
+                                    "variant": "tonal",
+                                    "text": ("「自动补链」默认**关闭**，开启后只会处理一种情况："
+                                             "媒体库文件是**独立副本**（与源内容完全一致、仅 inode 不同，"
+                                             "白占一份空间），此时按 inode 重建硬链接、释放空间。"
+                                             "护栏：仅当该副本 st_nlink=1（孤本，不会牵连其他文件）、"
+                                             "源文件存在、同文件系统、**字节数完全一致**时才动手；"
+                                             "先建临时链接校验 inode 再原子替换，失败自动回滚。"
+                                             "「目标文件不存在」的记录**不会**被修正 —— "
+                                             "源已删除时无物可链，重新下载只会被清理插件再次删掉。"),
+                                },
+                            }),
+                        ],
+                    },
                 ],
             }
         ], {
@@ -848,6 +1048,8 @@ class HardlinkVerify(_PluginBase):
             "max_records": 3000,
             "max_deep": 300,
             "min_vote": 10,
+            "auto_relink": False,
+            "relink_max": 50,
         }
 
     @staticmethod
@@ -881,6 +1083,8 @@ class HardlinkVerify(_PluginBase):
             "max_records": self._max_records,
             "max_deep": self._max_deep,
             "min_vote": self._min_vote,
+            "auto_relink": self._auto_relink,
+            "relink_max": self._relink_max,
         })
 
     # ==================================================================
@@ -955,6 +1159,8 @@ class HardlinkVerify(_PluginBase):
             self.__stat("硬链接异常", f"{last.get('link_bad', 0)} 项"),
             self.__stat("识别异常", f"{last.get('reco_bad', 0)} 项"),
             self.__stat("提示(非异常)", f"{last.get('notes', 0)} 条", "grey"),
+            self.__stat("已清理(无效)", f"{last.get('cleaned', 0)} 条", "grey"),
+            self.__stat("已补链(释放空间)", f"{last.get('relinked', 0)} 条", "green"),
             self.__stat("已忽略(被覆盖)", f"{last.get('superseded', 0)} 条", "grey"),
         ]
 
@@ -1047,8 +1253,10 @@ class HardlinkVerify(_PluginBase):
                                         "content": [
                                             {
                                                 "component": "VExpansionPanelTitle",
-                                                "text": f"非异常提示（{last.get('notes', 0)} 条，"
-                                                        f"多为综艺/国漫等中文名资源，仅供参考）",
+                                                "text": f"非异常提示（{last.get('notes', 0)} 条）"
+                                                        f"｜已清理 {last.get('cleaned', 0)} · "
+                                                        f"已补链 {last.get('relinked', 0)} · "
+                                                        f"其余为命名风险等弱信号，仅供参考",
                                             },
                                             {
                                                 "component": "VExpansionPanelText",
@@ -1129,7 +1337,7 @@ class HardlinkVerify(_PluginBase):
             card_props["color"] = color
         return {
             "component": "VCol",
-            "props": {"cols": 6, "md": 2},
+            "props": {"cols": 6, "md": 3},
             "content": [
                 {
                     "component": "VCard",
