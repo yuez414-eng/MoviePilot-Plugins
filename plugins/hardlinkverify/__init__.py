@@ -86,6 +86,32 @@ L1 已经就「文件没了」给出结论（superseded / cleaned / dest_missing
 （《Abigail》配成 1988 同名剧集、《Paprika》1991 配成 2018 真人版）
 全部照旧被拎出来 —— 这正是本插件该有的信噪比。
 
+== 误报抑制的代价：一处「压过头」的漏报（v1.5.2 修复） ==
+
+"被更新的整理记录接管"（superseded）原本的判据是「同剧同季有 id 更大的记录」。
+但 `transferhistory` 是**按文件逐条**记录的：一部剧一季 40 集就是 40 条记录、
+各自 dest 不同。于是「同剧同季只认最新那条」等于把这一季除最新一集外的**所有**
+记录都判成 superseded —— 而 L1 在 superseded 为真时会把"硬链接断开"降级成提示，
+**这些剧集的断链检查形同虚设**。
+
+本机实测：1625 条记录被这条规则压制，其中 1620 条目标文件存在且 mode=link。
+（当时真去比对 inode，被压制的断链数是 0 —— 所以没有造成实际漏报，但纯属运气。）
+
+v1.5.2 的修法是把两个场景的判据拆开：
+
+| 场景 | 判据 | 为什么 |
+|---|---|---|
+| 目标文件**已不存在** | 同路径 **或** 同剧同季 | 目标没了，多半就是被新记录搬走/替换了 |
+| 目标文件**还在**、只是 inode 断了 | **只看同路径** | 一季几十集各是一条记录，同剧同季判据在这里必然过度压制 |
+
+同一条修复里还有一个连带问题：「接管者」自己也可能已经成了僵尸。
+原实现只看 id 大小，于是僵尸记录要等接管者先被清掉才浮出来 ——
+**级联清理变成每轮只剥一条**（实测：同一部剧 5 条记录剥了 5 轮，
+而某剧单季有 122 条记录，最坏情况要 122 轮）。
+现在只有「接管记录的目标文件确实还在」才算真接管；接管者也成了僵尸时，
+两条都是孤儿，一并交给同一轮清理。取值遇不确定（接管记录不在本次读取窗口内）
+时按「算数」处理，宁可少删不多删。
+
 == 关于"自动修复"的边界（重要） ==
 本插件默认**只发现、不改数据**。可选开关「自动补链」只处理唯一一种确定安全的情况：
 
@@ -193,7 +219,7 @@ class HardlinkVerify(_PluginBase):
                    "无需填写任何路径 —— 判定数据全部来自 MoviePilot 自己的整理记录；"
                    "前提是下载目录与媒体库目录都已挂载进 MoviePilot 容器"
                    "（容器看不到的卷会被识别为「未挂载」并跳过，不会误报也不误删）。")
-    plugin_version = "1.5.1"
+    plugin_version = "1.5.2"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/hardlinkverify.png"
     author_url = ""
@@ -343,13 +369,16 @@ class HardlinkVerify(_PluginBase):
         # 同 dest / 同剧同季 的最新记录 id
         dest_latest: Dict[str, int] = {}
         key_latest: Dict[Tuple, int] = {}
+        id_dest: Dict[int, str] = {}
         for r in all_records:
             rid = getattr(r, "id", None)
             if not rid:
                 continue
+            rid = int(rid)
             d = getattr(r, "dest", None)
             if d:
                 dest_latest[d] = max(dest_latest.get(d, 0), rid)
+            id_dest[rid] = d or ""
             k = (getattr(r, "tmdbid", None), getattr(r, "seasons", None))
             if k[0]:
                 key_latest[k] = max(key_latest.get(k, 0), rid)
@@ -373,7 +402,8 @@ class HardlinkVerify(_PluginBase):
                 "skipped_unmounted": 0, "superseded": 0, "deep_done": 0,
                 "cleaned": 0, "relinked": 0, "pruned": 0}
 
-        ctx = {"dest_latest": dest_latest, "key_latest": key_latest, "stat": stat}
+        ctx = {"dest_latest": dest_latest, "key_latest": key_latest,
+               "id_dest": id_dest, "stat": stat}
 
         for rec in targets:
             stat["checked"] += 1
@@ -486,7 +516,7 @@ class HardlinkVerify(_PluginBase):
 
         # ---------- L1 硬链接 ----------
         if self._check_link and dest:
-            found.extend(self.__check_link(rec, base, superseded))
+            found.extend(self.__check_link(rec, base, superseded, ctx))
 
         # ---------- L2 + L3 识别 ----------
         # 识别校验回答的是「这份内容配对了吗」。目标文件已经不在了，这个问题就没有意义 ——
@@ -605,23 +635,66 @@ class HardlinkVerify(_PluginBase):
                 self._tmdb_api = False
         return self._tmdb_api or None
 
-    def __superseded_by(self, base: dict, ctx: dict) -> Optional[str]:
+    @staticmethod
+    def __superseder_alive(newer: int, id_dest: Dict[int, str]) -> bool:
+        """
+        判断「接管记录 #newer」自身还算不算数 —— 它的目标文件还在吗。
+
+        为什么需要这条：`superseded` 原本只看 id 大小（谁更晚整理谁就算接管）。
+        但接管者自己也可能已经成了僵尸（目标被清理插件删了），这时它并不能解释
+        旧记录的目标为什么消失 —— 两条都是孤儿，只是 id 一大一小而已。
+        不计这条会导致两个后果：
+          ① 级联清理变成「每轮只剥一条」（本机实测：同一部剧 5 条记录剥了 5 轮）；
+          ② 接管链越长越像死循环，让人误以为插件卡住了。
+
+        取值方向（保守优先）：
+          - 接管记录的 dest **确实不存在** → 它也是僵尸，不构成接管理由 → False；
+          - 接管记录的 dest **存在**        → 真接管 → True；
+          - 查不到接管记录（超出本次读取窗口）→ 无法判断，按「算数」处理 → True。
+        """
+        try:
+            newer = int(newer)
+        except (TypeError, ValueError):
+            return True
+        if newer not in id_dest:
+            return True
+        nd = id_dest.get(newer) or ""
+        if not nd:
+            return True
+        return os.path.exists(nd)
+
+    def __superseded_by(self, base: dict, ctx: dict, broad: bool = True) -> Optional[str]:
+        """
+        这条记录是否已被更晚的整理记录接管。
+
+        broad=True —— 同路径（dest 完全相同）**或** 同剧同季（tmdbid+seasons）有更新的记录。
+            用于「目标文件已不存在」这一支：旧记录的目标没了，多半就是被新记录搬走/替换了。
+
+        broad=False —— **只看同路径**。用于「目标文件还在、但硬链接断了」这一支。
+            这里绝不能套用「同剧同季」判据：transferhistory 是**按文件逐条**记的，
+            一部剧一季几十集就是几十条记录、各自 dest 不同。若按「同剧同季只认最新的
+            那一条」，则除最新一集外的所有剧集都会被判定为 superseded，它们的断链会被
+            静默吞掉（本机实测：1625 条记录被这条规则压制，其中 1620 条目标存在且
+            mode=link —— 也就是说这些剧集的断链检查形同虚设）。
+        """
         rid = base["id"] or 0
         if not rid:
             return None
+        id_dest = ctx.get("id_dest") or {}
         d = base["dest"]
         if d:
             newer = ctx["dest_latest"].get(d, 0)
-            if newer > rid:
+            if newer > rid and self.__superseder_alive(newer, id_dest):
                 return f"同路径已被更新的整理记录 #{newer} 覆盖"
-        if base["tmdbid"]:
+        if broad and base["tmdbid"]:
             newer = ctx["key_latest"].get((base["tmdbid"], base["seasons"]), 0)
-            if newer > rid:
+            if newer > rid and self.__superseder_alive(newer, id_dest):
                 return f"同剧同季已被更新的整理记录 #{newer} 覆盖"
         return None
 
     # ---------------------------- L1 ----------------------------
-    def __check_link(self, rec, base: dict, superseded: Optional[str]) -> List[dict]:
+    def __check_link(self, rec, base: dict, superseded: Optional[str],
+                     ctx: Optional[dict] = None) -> List[dict]:
         srcs = rec.files if isinstance(getattr(rec, "files", None), list) and rec.files else []
         if not srcs and base["src"]:
             srcs = [base["src"]]
@@ -690,9 +763,15 @@ class HardlinkVerify(_PluginBase):
                 broken.append(s)
 
         if broken:
-            if superseded:
-                emit("superseded", "info", superseded,
-                     f"{len(broken)} 个源文件与目标不再同 inode —— {superseded}")
+            # 注意：这里**只认「同路径被覆盖」**，不认「同剧同季」——
+            # 一季几十集各是一条记录、dest 各不相同，按「同剧同季只认最新」的话
+            # 除最新一集外的断链全会被吞掉（详见 __superseded_by 的说明）。
+            superseded_dest = (
+                self.__superseded_by(base, ctx, broad=False) if ctx else superseded
+            )
+            if superseded_dest:
+                emit("superseded", "info", superseded_dest,
+                     f"{len(broken)} 个源文件与目标不再同 inode —— {superseded_dest}")
             else:
                 fixed = self.__try_relink(broken, base, dest)
                 if fixed:
@@ -772,7 +851,8 @@ class HardlinkVerify(_PluginBase):
 
         护栏（全部满足才动手）：
           1. 开关 self._auto_prune 开启，且未超出本轮 self._prune_max 上限；
-          2. 非「被更新记录接管」（superseded 的旧记录保留，留作追溯）；
+          2. 非「被更新记录接管」（接管记录**自身的目标文件还在**才算接管；
+             接管者也已成僵尸时不构成保留理由，两条都是孤儿，留给本轮一起清）；
           3. __is_prunable：源与目标确实都不存在，且相关卷均已挂载进容器；
           4. 删除前把整行记录快照写进插件数据 prune_log（保留最近 10 轮），
              随时可翻查、可人工恢复。
