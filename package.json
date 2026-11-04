@@ -21,5 +21,21 @@
     },
     "v2": true,
     "v3": false
+  },
+  "VideoCacheCleaner": {
+    "name": "转码缓存清理",
+    "description": "定时清理绿联影视中心产生的 HLS 转码缓存。UGOS 在非原画播放时会把视频实时转成 HLS 分片，落在每卷根目录的隐藏目录里 —— 旧客户端/APP 走 `@video`，新版网页播放器走 `@video_web`，文件管理器看不见、无上限、无自动清理，实测 2.6~4 GB/天，几天就能把数据卷吃到 100% 满。插件通过 MoviePilot 容器已挂载的 docker.sock 临时起 alpine 容器、以 root 身份删除这两个目录下的分片与空目录，等价于手工 docker run。可定时 + 手动触发，每次按卷汇总清理前后大小/文件数/释放空间写入详情页。只删转码缓存，不碰 @thumbnail/@home/@search；删除后下次播放自动重建，零数据风险。",
+    "version": "1.0.1",
+    "author": "spizmm",
+    "icon": "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/videocachecleaner.png",
+    "labels": "工具,系统",
+    "level": 1,
+    "history": {
+      "v2": {
+        "0": "首个版本 1.0.1：同时清理 `@video`（旧客户端转码）与 `@video_web`（新版网页播放器分片）两个目录，按卷汇总「清理前/后 GB、释放 GB、文件数」写入详情页。1.0.0 只在私有环境跑过、且硬编码只清 `@video`，实测日志天天 files=0/released=0（网页播放的分片早搬去 `@video_web` 了），故首发即 1.0.1。"
+      }
+    },
+    "v2": true,
+    "v3": false
   }
 }
