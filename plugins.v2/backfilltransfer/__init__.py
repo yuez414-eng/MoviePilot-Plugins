@@ -146,7 +146,7 @@ class BackfillTransfer(_PluginBase):
                    "失败记录由 MP 清理后重试）。四道安全闸门：试运行预览、"
                    "只在种子 100% 完成后整理、写盘冷却时间、体积下限与屏蔽词。"
                    "只整理、不删文件，整理方式沿用目录配置（硬链接）。")
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/backfilltransfer.png"
     author_url = "https://github.com/yuez414-eng"
@@ -369,7 +369,7 @@ class BackfillTransfer(_PluginBase):
             item = dict(pkg)
             if dry_run:
                 item["state"] = "preview"
-                item["msg"] = self.__preview_one(pkg)
+                item["msg"] = self.__preview_one(item)
             else:
                 state, msg = self.__apply_one(pkg)
                 item["state"] = state
@@ -700,10 +700,13 @@ class BackfillTransfer(_PluginBase):
         except Exception as e:
             logger.error(f"【存量补整理】试运行 {pkg['name']} 出错：{e}")
             return f"试运行异常：{e}"
-        if not ok:
-            return f"试运行不可行：{ret}"
         if not isinstance(ret, dict):
-            return "规划完成"
+            return "规划完成" if ok else f"试运行不可行：{str(ret)[:120]}"
+
+        summary0 = ret.get("summary") or {}
+        items0 = ret.get("items") or []
+        if not items0 and not ok:
+            return f"试运行不可行：{str(ret.get('message') or ret)[:150]}"
 
         summary = ret.get("summary") or {}
         items = ret.get("items") or []
@@ -721,12 +724,21 @@ class BackfillTransfer(_PluginBase):
         if items:
             pkg["plan_sample"] = (items[0].get("target") or "")
 
-        msg = (f"规划 {summary.get('total', 0)} 个"
-               f"（成功 {summary.get('success', 0)}/失败 {summary.get('failed', 0)}）")
+        fails = [it for it in items0 if not it.get("success")]
+        reasons: List[str] = []
+        for it in fails:
+            r = (it.get("message") or "失败").strip()
+            if r not in reasons:
+                reasons.append(r)
+
+        msg = (f"规划 {summary0.get('total', 0)} 个"
+               f"（成功 {summary0.get('success', 0)}/失败 {summary0.get('failed', 0)}）")
         if titles:
             msg += "｜识别：" + "、".join(titles[:2])
             if len(titles) > 1:
                 msg += f" 等 {len(titles)} 个标题"
+        if fails:
+            msg = "⚠️ " + msg + "｜失败原因：" + "；".join(reasons[:2])
         return msg
 
     def __apply_one(self, pkg: dict) -> Tuple[str, str]:
