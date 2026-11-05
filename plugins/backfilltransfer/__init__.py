@@ -146,7 +146,7 @@ class BackfillTransfer(_PluginBase):
                    "失败记录由 MP 清理后重试）。四道安全闸门：试运行预览、"
                    "只在种子 100% 完成后整理、写盘冷却时间、体积下限与屏蔽词。"
                    "只整理、不删文件，整理方式沿用目录配置（硬链接）。")
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/backfilltransfer.png"
     author_url = "https://github.com/yuez414-eng"
@@ -169,6 +169,7 @@ class BackfillTransfer(_PluginBase):
     _max_files: int = 200000
     _exclude_words: str = ""
     _include_risky: bool = False
+    _skip_conflict: bool = True
 
     _running: bool = False
     _progress: str = ""
@@ -195,6 +196,7 @@ class BackfillTransfer(_PluginBase):
         self._max_files = max(1000, self.__to_int(config.get("max_files"), 200000))
         self._exclude_words = (config.get("exclude_words") or "").strip()
         self._include_risky = bool(config.get("include_risky", False))
+        self._skip_conflict = bool(config.get("skip_conflict", True))
 
         if self._onlyonce:
             logger.info("【存量补整理】立即运行一次")
@@ -416,6 +418,7 @@ class BackfillTransfer(_PluginBase):
             "submitted": 0,
             "ok": 0,
             "fail": 0,
+            "skip": 0,
             "items": [dict(c, msg=self.__exclude_reason(c)) for c in excluded],
         }
 
@@ -445,6 +448,8 @@ class BackfillTransfer(_PluginBase):
                     result["ok"] += 1
                 elif state == "fail":
                     result["fail"] += 1
+                elif state == "skip":
+                    result["skip"] += 1
             result["items"].append(item)
 
         if skipped_by_limit > 0:
@@ -457,7 +462,8 @@ class BackfillTransfer(_PluginBase):
         self.__notify_result(result)
         logger.info(f"【存量补整理】结束：候选 {result['candidates']} 包 / "
                     f"{result['files']} 文件 / {result['gb']} GB，"
-                    f"提交 {result['submitted']}，成功 {result['ok']}，失败 {result['fail']}")
+                    f"提交 {result['submitted']}，成功 {result['ok']}，"
+                    f"失败 {result['fail']}，跳过 {result.get('skip', 0)}")
         return result
 
     # ==================================================================
@@ -747,17 +753,17 @@ class BackfillTransfer(_PluginBase):
         return FileItem(storage=pkg["storage"], path=path, type="file", name=base,
                         basename=stem, extension=ext.lstrip("."), size=size)
 
-    def __preview_one(self, pkg: dict) -> str:
-        """试运行：只算规划，同时把识别出的标题与目标路径样本记下来。
+    def __plan_one(self, pkg: dict) -> Tuple[bool, Any]:
+        """只做规划（不改文件），并记录识别标题 / 目标路径 / 目标冲突数。
 
-        这一步的价值不只是「能不能整理」，更是**识别对不对** ——
-        历史上出现过《灰欲人生》被识别成《人间余味 (2021)》这类误配，
-        只看「成功 62/62」是看不出来的，必须把目标路径摊开。
+        目标冲突 = 规划出的目标文件在库里**已经存在同名文件**。
+        这种情况几乎都是「库里早就有一版，下载目录里躺着另一版」，
+        直接整理会覆盖已有集数（或产生重复条目），必须先看见再决定。
         """
         from app.chain.transfer import TransferChain
         fileitem = self.__fileitem(pkg)
         if fileitem is None:
-            return "文件项构建失败"
+            return False, "文件项构建失败"
         try:
             ok, ret = TransferChain().do_transfer(
                 fileitem=fileitem, manual=True, background=False,
@@ -765,19 +771,15 @@ class BackfillTransfer(_PluginBase):
             )
         except Exception as e:
             logger.error(f"【存量补整理】试运行 {pkg['name']} 出错：{e}")
-            return f"试运行异常：{e}"
+            return False, f"试运行异常：{e}"
         if not isinstance(ret, dict):
-            return "规划完成" if ok else f"试运行不可行：{str(ret)[:120]}"
+            pkg["conflict"] = 0
+            return ok, ret
 
-        summary0 = ret.get("summary") or {}
-        items0 = ret.get("items") or []
-        if not items0 and not ok:
-            return f"试运行不可行：{str(ret.get('message') or ret)[:150]}"
-
-        summary = ret.get("summary") or {}
         items = ret.get("items") or []
         titles: List[str] = []
         dirs: List[str] = []
+        conflicts = 0
         for it in items:
             t = (it.get("title") or "").strip()
             if t and t not in titles:
@@ -785,16 +787,38 @@ class BackfillTransfer(_PluginBase):
             td = (it.get("target_dir") or "").strip()
             if td and td not in dirs:
                 dirs.append(td)
-        conflicts = 0
-        for it in items:
             tgt = (it.get("target") or "").strip()
             if tgt and os.path.exists(tgt):
                 conflicts += 1
         pkg["conflict"] = conflicts
         pkg["titles"] = titles[:6]
         pkg["plan_dirs"] = [d.rsplit("/", 1)[-1] for d in dirs[:6]]
+        pkg["plan_total"] = (ret.get("summary") or {}).get("total", 0)
         if items:
             pkg["plan_sample"] = (items[0].get("target") or "")
+        return ok, ret
+
+    def __preview_one(self, pkg: dict) -> str:
+        """试运行：只算规划，同时把识别出的标题与目标路径样本记下来。
+
+        这一步的价值不只是「能不能整理」，更是**识别对不对** ——
+        历史上出现过《灰欲人生》被识别成《人间余味 (2021)》这类误配，
+        只看「成功 62/62」是看不出来的，必须把目标路径摊开。
+        """
+        ok, ret = self.__plan_one(pkg)
+        if not isinstance(ret, dict):
+            if isinstance(ret, str) and (ret.startswith("文件项") or
+                                         ret.startswith("试运行异常")):
+                return ret
+            return "规划完成" if ok else f"试运行不可行：{str(ret)[:120]}"
+
+        summary0 = ret.get("summary") or {}
+        items0 = ret.get("items") or []
+        if not items0 and not ok:
+            return f"试运行不可行：{str(ret.get('message') or ret)[:150]}"
+
+        titles = pkg.get("titles") or []
+        conflicts = pkg.get("conflict") or 0
 
         fails = [it for it in items0 if not it.get("success")]
         reasons: List[str] = []
@@ -810,7 +834,7 @@ class BackfillTransfer(_PluginBase):
             if len(titles) > 1:
                 msg += f" 等 {len(titles)} 个标题"
         if conflicts:
-            msg += f"｜⚠️ 目标已存在 {conflicts} 个（会覆盖）"
+            msg += f"｜⚠️ 目标已存在 {conflicts} 个（会覆盖库内已有）"
         if fails:
             msg = "⚠️ " + msg + "｜失败原因：" + "；".join(reasons[:2])
         return msg
@@ -820,6 +844,27 @@ class BackfillTransfer(_PluginBase):
         fileitem = self.__fileitem(pkg)
         if fileitem is None:
             return "fail", "文件项构建失败"
+
+        # 护栏：先规划一遍，若目标与库里已有文件重名 → 整包跳过。
+        # 宁可少整理一包，也不能把已有的集数覆盖掉（覆盖会带走旧文件的硬链接）。
+        if self._skip_conflict:
+            try:
+                ok0, ret0 = self.__plan_one(pkg)
+            except Exception as e:
+                logger.warning(f"【存量补整理】{pkg['name']} 规划预检失败：{e}")
+                ok0, ret0 = True, {}
+            conflict = pkg.get("conflict") or 0
+            if conflict:
+                total = pkg.get("plan_total") or conflict
+                dirs = "、".join(pkg.get("plan_dirs") or [])
+                return "skip", (f"⚠️ 目标已存在 {conflict}/{total} 个"
+                                f"（{dirs}），已跳过 —— 库内已有同集数，"
+                                f"整理会覆盖。确认要替换请关掉「目标冲突时跳过」")
+            if not ok0 and isinstance(ret0, dict):
+                summary0 = ret0.get("summary") or {}
+                if summary0.get("success", 0) == 0:
+                    return "fail", "规划全部失败（未识别到媒体信息），已跳过"
+
         try:
             ok, ret = TransferChain().do_transfer(
                 fileitem=fileitem, manual=True, background=False,
@@ -850,6 +895,7 @@ class BackfillTransfer(_PluginBase):
             "submitted": result.get("submitted", 0),
             "ok": result.get("ok", 0),
             "fail": result.get("fail", 0),
+            "skip": result.get("skip", 0),
         })
         self.save_data("history", history[:_MAX_HISTORY])
 
@@ -870,8 +916,8 @@ class BackfillTransfer(_PluginBase):
             lines.append(f"另有 {result['skipped_by_limit']} 个包超出单轮上限，下轮继续。")
         lines.append("")
         for it in (result.get("items") or [])[:12]:
-            state = {"preview": "试运行", "ok": "成功", "fail": "失败"}.get(
-                it.get("state"), it.get("state"))
+            state = {"preview": "试运行", "ok": "成功", "fail": "失败",
+                     "skip": "跳过"}.get(it.get("state"), it.get("state"))
             lines.append(f"- [{state}] {it.get('name', '')[:52]} "
                          f"({it.get('files', 0)} 个 / {it.get('gb', 0)} GB) "
                          f"{it.get('msg', '')[:80]}")
@@ -900,6 +946,7 @@ class BackfillTransfer(_PluginBase):
                             self.__col(2, self.__switch("dry_run", "试运行(不动文件)")),
                             self.__col(2, self.__switch("only_completed", "只在种子完成后整理")),
                             self.__col(2, self.__switch("scrape", "整理后刮削")),
+                            self.__col(2, self.__switch("skip_conflict", "目标冲突时跳过")),
                         ],
                     },
                     {
@@ -961,6 +1008,24 @@ class BackfillTransfer(_PluginBase):
                                 "component": "VAlert",
                                 "props": {
                                     "type": "error", "variant": "tonal",
+                                    "text": ("「目标冲突时跳过」建议保持**开启**：整理前先按同一套规则"
+                                             "规划一遍，若算出来的目标文件在媒体库里已经存在同名文件"
+                                             "（库里早就有一版、下载目录躺着另一版），整包跳过。"
+                                             "核对数据时实测 23 个候选包里有 10 包属于这种"
+                                             "「同剧不同版」，真整理会覆盖库里已有集数 ——"
+                                             "而被覆盖的旧文件是硬链接，覆盖后旧源文件会掉成"
+                                             "单链接（nlink=1），属于不可逆损伤。"),
+                                },
+                            }),
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            self.__col(12, {
+                                "component": "VAlert",
+                                "props": {
+                                    "type": "error", "variant": "tonal",
                                     "text": ("「只在种子完成后整理」是「边下边整理」的根因防护："
                                              "包名能在下载器里匹配到、且进度不足 100% 的一律跳过。"
                                              "「写盘冷却」再兜一层 —— 包内最新修改时间距今不足 N 分钟的"
@@ -986,6 +1051,7 @@ class BackfillTransfer(_PluginBase):
             "max_files": 200000,
             "exclude_words": "",
             "include_risky": False,
+            "skip_conflict": True,
         }
 
     @staticmethod
@@ -1022,6 +1088,7 @@ class BackfillTransfer(_PluginBase):
             "max_files": self._max_files,
             "exclude_words": self._exclude_words,
             "include_risky": self._include_risky,
+            "skip_conflict": self._skip_conflict,
         })
 
     # ==================================================================
