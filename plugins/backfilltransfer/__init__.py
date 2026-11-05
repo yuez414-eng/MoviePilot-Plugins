@@ -146,7 +146,7 @@ class BackfillTransfer(_PluginBase):
                    "失败记录由 MP 清理后重试）。四道安全闸门：试运行预览、"
                    "只在种子 100% 完成后整理、写盘冷却时间、体积下限与屏蔽词。"
                    "只整理、不删文件，整理方式沿用目录配置（硬链接）。")
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/backfilltransfer.png"
     author_url = "https://github.com/yuez414-eng"
@@ -228,6 +228,13 @@ class BackfillTransfer(_PluginBase):
                 "description": "mode=scan 只扫描；mode=apply 按当前配置执行补整理（受试运行开关约束）",
             },
             {
+                "path": "/one",
+                "endpoint": self.__api_one,
+                "methods": ["POST"],
+                "summary": "单个资源包整理",
+                "description": "path=资源包绝对路径，apply=false 只试运行；apply=true 真正整理",
+            },
+            {
                 "path": "/status",
                 "endpoint": self.__api_status,
                 "methods": ["GET"],
@@ -275,6 +282,65 @@ class BackfillTransfer(_PluginBase):
             return {"success": False, "message": "已有任务在运行，请稍候"}
         return {"success": True,
                 "message": "已开始扫描" if mode == "scan" else "已开始补整理（后台执行）"}
+
+    def __api_one(self, path: str = "", apply: bool = False) -> dict:
+        """针对单个资源包执行（dry-run / 真整理）。
+
+        用于「只想补其中几个包」的场景 —— 全量 apply 会把识别错的、目标冲突的
+        一起塞进整理队列，而失败的整理会留下 status=false 的记录，
+        反过来让目录监控永久跳过这批文件（dispatcher 见到记录就 return False）。
+        """
+        path = (path or "").strip().replace("\\", "/").rstrip("/")
+        if not path or not os.path.exists(path):
+            return {"success": False, "message": f"路径不存在：{path}"}
+        pkg = self.__pkg_of(path)
+        if not pkg:
+            return {"success": False, "message": "该路径下没有视频文件，或不在已配置的下载目录内"}
+        if not apply:
+            msg = self.__preview_one(pkg)
+            return {"success": True, "message": "试运行完成",
+                    "data": {"msg": msg, "titles": pkg.get("titles") or [],
+                             "conflict": pkg.get("conflict", 0),
+                             "plan_sample": pkg.get("plan_sample", "")}}
+        state, msg = self.__apply_one(pkg)
+        return {"success": state == "ok", "message": msg,
+                "data": {"state": state, "name": pkg["name"]}}
+
+    def __pkg_of(self, path: str) -> Optional[dict]:
+        """把任意下载目录内的路径包成 pkg 结构（用于单包操作）"""
+        root = None
+        for r in self.__roots():
+            if path.startswith(r["path"] + "/") or path == r["path"]:
+                root = r
+                break
+        if root is None:
+            return None
+        entry = None
+        rel = path[len(root["path"]):].lstrip("/")
+        first = rel.split("/")[0]
+        try:
+            entry = next((e for e in os.scandir(root["path"]) if e.name == first), None)
+        except Exception:
+            return None
+        if entry is None:
+            return None
+        stat = {"files": 0, "pkgs": 0}
+        videos, total, _newest = self.__collect(entry, 0, stat)
+        if not videos:
+            return None
+        return {
+            "name": entry.name,
+            "path": (entry.path or "").replace("\\", "/"),
+            "root": root["path"],
+            "storage": root["storage"],
+            "is_dir": bool(entry.is_dir()),
+            "files": len(videos),
+            "total_files": total,
+            "gb": round(sum(v[1] for v in videos) / 1024 ** 3, 2),
+            "progress": None,
+            "state": "pending",
+            "msg": "",
+        }
 
     def __api_status(self) -> dict:
         return {"running": self._running, "progress": self._progress,
@@ -719,6 +785,12 @@ class BackfillTransfer(_PluginBase):
             td = (it.get("target_dir") or "").strip()
             if td and td not in dirs:
                 dirs.append(td)
+        conflicts = 0
+        for it in items:
+            tgt = (it.get("target") or "").strip()
+            if tgt and os.path.exists(tgt):
+                conflicts += 1
+        pkg["conflict"] = conflicts
         pkg["titles"] = titles[:6]
         pkg["plan_dirs"] = [d.rsplit("/", 1)[-1] for d in dirs[:6]]
         if items:
@@ -737,6 +809,8 @@ class BackfillTransfer(_PluginBase):
             msg += "｜识别：" + "、".join(titles[:2])
             if len(titles) > 1:
                 msg += f" 等 {len(titles)} 个标题"
+        if conflicts:
+            msg += f"｜⚠️ 目标已存在 {conflicts} 个（会覆盖）"
         if fails:
             msg = "⚠️ " + msg + "｜失败原因：" + "；".join(reasons[:2])
         return msg
