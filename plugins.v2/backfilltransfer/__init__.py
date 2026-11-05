@@ -146,7 +146,7 @@ class BackfillTransfer(_PluginBase):
                    "失败记录由 MP 清理后重试）。四道安全闸门：试运行预览、"
                    "只在种子 100% 完成后整理、写盘冷却时间、体积下限与屏蔽词。"
                    "只整理、不删文件，整理方式沿用目录配置（硬链接）。")
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "spizmm"
     plugin_icon = "https://raw.githubusercontent.com/yuez414-eng/MoviePilot-Plugins/main/icons/backfilltransfer.png"
     author_url = "https://github.com/yuez414-eng"
@@ -682,6 +682,12 @@ class BackfillTransfer(_PluginBase):
                         basename=stem, extension=ext.lstrip("."), size=size)
 
     def __preview_one(self, pkg: dict) -> str:
+        """试运行：只算规划，同时把识别出的标题与目标路径样本记下来。
+
+        这一步的价值不只是「能不能整理」，更是**识别对不对** ——
+        历史上出现过《灰欲人生》被识别成《人间余味 (2021)》这类误配，
+        只看「成功 62/62」是看不出来的，必须把目标路径摊开。
+        """
         from app.chain.transfer import TransferChain
         fileitem = self.__fileitem(pkg)
         if fileitem is None:
@@ -696,12 +702,32 @@ class BackfillTransfer(_PluginBase):
             return f"试运行异常：{e}"
         if not ok:
             return f"试运行不可行：{ret}"
-        if isinstance(ret, dict):
-            summary = ret.get("summary") or {}
-            return (f"规划 {summary.get('total', 0)} 个文件"
-                    f"（成功 {summary.get('success', 0)} / "
-                    f"失败 {summary.get('failed', 0)}）")
-        return "规划完成"
+        if not isinstance(ret, dict):
+            return "规划完成"
+
+        summary = ret.get("summary") or {}
+        items = ret.get("items") or []
+        titles: List[str] = []
+        dirs: List[str] = []
+        for it in items:
+            t = (it.get("title") or "").strip()
+            if t and t not in titles:
+                titles.append(t)
+            td = (it.get("target_dir") or "").strip()
+            if td and td not in dirs:
+                dirs.append(td)
+        pkg["titles"] = titles[:6]
+        pkg["plan_dirs"] = [d.rsplit("/", 1)[-1] for d in dirs[:6]]
+        if items:
+            pkg["plan_sample"] = (items[0].get("target") or "")
+
+        msg = (f"规划 {summary.get('total', 0)} 个"
+               f"（成功 {summary.get('success', 0)}/失败 {summary.get('failed', 0)}）")
+        if titles:
+            msg += "｜识别：" + "、".join(titles[:2])
+            if len(titles) > 1:
+                msg += f" 等 {len(titles)} 个标题"
+        return msg
 
     def __apply_one(self, pkg: dict) -> Tuple[str, str]:
         from app.chain.transfer import TransferChain
@@ -965,6 +991,7 @@ class BackfillTransfer(_PluginBase):
             "gb": it.get("gb", 0),
             "progress": (f"{it.get('progress')}%" if it.get("progress") is not None
                          else "-"),
+            "titles": "、".join(it.get("titles") or []) or "-",
             "state": {"preview": "试运行", "ok": "成功", "fail": "失败",
                       "pending": "待处理", "in_library": "已在库",
                       "shared": "有其它链接"}.get(
@@ -1054,6 +1081,7 @@ class BackfillTransfer(_PluginBase):
                                  "width": "90"},
                                 {"title": "种子进度", "key": "progress", "sortable": False,
                                  "width": "90"},
+                                {"title": "识别结果", "key": "titles", "sortable": False},
                                 {"title": "结果", "key": "state", "sortable": False,
                                  "width": "80"},
                                 {"title": "说明", "key": "msg", "sortable": False},
